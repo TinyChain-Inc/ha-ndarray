@@ -1405,19 +1405,30 @@ mod tests {
 
     #[test]
     fn test_slice() -> Result<(), Error> {
+        use crate::NDArrayMathScalar;
+
         let buf = OpenCL::copy_into_buffer::<u32>(&[0; 6])?;
+        let backing = buf.clone();
         let array = ArrayBuf::new(buf, shape![2, 3])?;
         let mut slice = array.slice(slice![AxisRange::In(0, 2, 1), AxisRange::At(1)])?;
 
         let buf = OpenCL::copy_into_buffer::<u32>(&[0, 0])?;
         let zeros = ArrayBuf::new(buf, shape![2])?;
 
-        let buf = OpenCL::copy_into_buffer::<u32>(&[0, 0])?;
-        let ones = ArrayBuf::new(buf, shape![2])?;
+        let buf = OpenCL::copy_into_buffer::<u32>(&[1, 1])?;
+        let twos = ArrayBuf::new(buf, shape![2])?.add_scalar(1)?;
 
         assert!(slice.as_ref().eq(zeros)?.all()?);
 
-        slice.write(&ones)?;
+        slice.write(&twos)?;
+        assert!(slice.as_ref().eq(twos)?.all()?);
+        let mut values = vec![0; 6];
+        backing.read(&mut values).enq()?;
+        assert_eq!(values, vec![0, 2, 0, 0, 2, 0]);
+        slice.write_value(3)?;
+        slice.write_value(4)?;
+        backing.read(&mut values).enq()?;
+        assert_eq!(values, vec![0, 4, 0, 0, 4, 0]);
 
         Ok(())
     }

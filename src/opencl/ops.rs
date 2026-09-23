@@ -1419,7 +1419,7 @@ where
         let size_hint = self.size();
         let source = self.access.cl_buffer()?;
 
-        let queue = OpenCL::queue(size_hint, &[source.default_queue()])?;
+        let queue = OpenCL::queue(size_hint, &[data.default_queue(), source.default_queue()])?;
 
         if self.write.is_none() {
             let program = programs::slice::write_to_slice(T::TYPE, self.spec.clone())?;
@@ -1435,15 +1435,16 @@ where
                     .expect("CL write op")
                     .for_queue(&queue)?,
             )
-            .queue(queue)
-            .global_work_size(source.len())
-            .arg(source)
+            .queue(queue.clone())
+            .global_work_size(size_hint)
+            .arg(&*source)
             .arg(&*data)
             .build()?;
 
         // SAFETY: kernel arguments and dimensions are validated, and all referenced
         // buffers outlive this enqueue.
         unsafe { kernel.enq()? }
+        source.set_default_queue(queue);
 
         Ok(())
     }
@@ -1454,7 +1455,7 @@ where
 
         let queue = OpenCL::queue(size_hint, &[source.default_queue()])?;
 
-        if self.write.is_none() {
+        if self.write_value.is_none() {
             let program = programs::slice::write_value_to_slice(T::TYPE, self.spec.clone())?;
             self.write_value = Some(program);
         }
@@ -1468,15 +1469,16 @@ where
                     .expect("CL write op")
                     .for_queue(&queue)?,
             )
-            .queue(queue)
-            .global_work_size(source.len())
-            .arg(source)
+            .queue(queue.clone())
+            .global_work_size(size_hint)
+            .arg(&*source)
             .arg(value)
             .build()?;
 
         // SAFETY: kernel arguments and dimensions are validated, and all referenced
         // buffers outlive this enqueue.
         unsafe { kernel.enq()? }
+        source.set_default_queue(queue);
 
         Ok(())
     }
