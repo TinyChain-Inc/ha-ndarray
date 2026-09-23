@@ -1,6 +1,8 @@
+#![doc = include_str!("../NUMERICS.md")]
+
 use std::cmp::Ordering;
 use std::fmt;
-use std::ops::{Add, Div, Mul, Rem, Sub};
+use std::ops::{Add, Div, Mul, Sub};
 
 use number_general as ng;
 use safecast::CastFrom;
@@ -34,6 +36,7 @@ mod buffer;
 #[cfg(feature = "complex")]
 pub mod fft;
 pub mod host;
+mod numeric;
 #[cfg(feature = "opencl")]
 pub mod opencl;
 pub mod ops;
@@ -95,7 +98,8 @@ pub trait Number: CLType + Into<ng::Number> + CastFrom<ng::Number> + Default {
     /// Subtract two instances of this type.
     fn sub(self, other: Self) -> Self;
 
-    /// Raise this value to the power of the given `exp`onent.
+    /// Raise this value to the power of the given exponent.
+    /// Integer powers wrap at full width; negative exponents follow the crate numerical contract.
     fn pow(self, exp: Self) -> Self;
 }
 
@@ -189,112 +193,58 @@ number!(
     f64::powf
 );
 
-number!(
-    i8,
-    Self,
-    1,
-    0,
-    Self::wrapping_abs,
-    Self::wrapping_add,
-    |l, r| if r == 0 { 0 } else { Self::wrapping_div(l, r) },
-    Self::wrapping_mul,
-    Self::wrapping_sub,
-    |a, e| f32::powi(a as f32, e as i32) as i8
-);
-
-number!(
-    i16,
-    Self,
-    1,
-    0,
-    Self::wrapping_abs,
-    Self::wrapping_add,
-    |l, r| if r == 0 { 0 } else { Self::wrapping_div(l, r) },
-    Self::wrapping_mul,
-    Self::wrapping_sub,
-    |a, e| f32::powi(a as f32, e as i32) as i16
-);
-
-number!(
-    i32,
-    Self,
-    1,
-    0,
-    Self::wrapping_abs,
-    Self::wrapping_add,
-    |l, r| if r == 0 { 0 } else { Self::wrapping_div(l, r) },
-    Self::wrapping_mul,
-    Self::wrapping_sub,
-    |a, e| f32::powi(a as f32, e) as i32
-);
-
-number!(
-    i64,
-    Self,
-    1,
-    0,
-    Self::wrapping_abs,
-    Self::wrapping_add,
-    |l, r| if r == 0 { 0 } else { Self::wrapping_div(l, r) },
-    Self::wrapping_mul,
-    Self::wrapping_sub,
-    |a, e| f64::powi(
-        a as f64,
-        i32::try_from(e).unwrap_or(if e >= 0 { i32::MAX } else { i32::MIN })
-    ) as i64
-);
-
-number!(
-    u8,
-    Self,
-    1,
-    0,
-    id,
-    Self::wrapping_add,
-    |l, r| if r == 0 { 0 } else { Self::wrapping_div(l, r) },
-    Self::wrapping_mul,
-    Self::wrapping_sub,
-    |a, e| u8::pow(a, e as u32)
-);
-
-number!(
-    u16,
-    Self,
-    1,
-    0,
-    id,
-    Self::wrapping_add,
-    |l, r| if r == 0 { 0 } else { Self::wrapping_div(l, r) },
-    Self::wrapping_mul,
-    Self::wrapping_sub,
-    |a, e| u16::pow(a, e as u32)
-);
-
-number!(
-    u32,
-    Self,
-    1,
-    0,
-    id,
-    Self::wrapping_add,
-    |l, r| if r == 0 { 0 } else { Self::wrapping_div(l, r) },
-    Self::wrapping_mul,
-    Self::wrapping_sub,
-    u32::pow
-);
-
-number!(
-    u64,
-    Self,
-    1,
-    0,
-    id,
-    Self::wrapping_add,
-    |l, r| if r == 0 { 0 } else { Self::wrapping_div(l, r) },
-    Self::wrapping_mul,
-    Self::wrapping_sub,
-    |a, e| u64::pow(a, u32::try_from(e).unwrap_or(u32::MAX))
-);
+// Exponentiation stays in the integer domain, including full-width exponents.
+macro_rules! integer_number {
+    ($t:ty, $signed:expr) => {
+        number!(
+            $t,
+            Self,
+            1,
+            0,
+            |n: Self| if $signed && (n as i128) < 0 {
+                n.wrapping_neg()
+            } else {
+                n
+            },
+            Self::wrapping_add,
+            |l, r| if r == 0 { 0 } else { Self::wrapping_div(l, r) },
+            Self::wrapping_mul,
+            Self::wrapping_sub,
+            |mut base: Self, mut exp: Self| {
+                if $signed && (exp as i128) < 0 {
+                    return if base == 1 {
+                        1
+                    } else if base == (1 as Self).wrapping_neg() {
+                        if exp & 1 == 0 {
+                            1
+                        } else {
+                            base
+                        }
+                    } else {
+                        0
+                    };
+                }
+                let mut result: Self = 1;
+                while exp != 0 {
+                    if exp & 1 != 0 {
+                        result = result.wrapping_mul(base);
+                    }
+                    exp >>= 1;
+                    base = base.wrapping_mul(base);
+                }
+                result
+            }
+        );
+    };
+}
+integer_number!(i8, true);
+integer_number!(i16, true);
+integer_number!(i32, true);
+integer_number!(i64, true);
+integer_number!(u8, false);
+integer_number!(u16, false);
+integer_number!(u32, false);
+integer_number!(u64, false);
 
 #[cfg(not(feature = "opencl"))]
 /// A real-valued [`Number`]
@@ -305,16 +255,16 @@ pub trait Real: Number + PartialOrd {
     /// The minimum value of this data type.
     const MIN: Self;
 
-    /// Return the maximum of the given values.
+    /// Return the maximum; floating NaNs propagate and equal zeros select +0.
     fn max(l: Self, r: Self) -> Self;
 
-    /// Return the maximum of the given values.
+    /// Return the minimum; floating NaNs propagate and equal zeros select -0.
     fn min(l: Self, r: Self) -> Self;
 
     /// Compute the remainder of `self.div(other)`.
     fn rem(self, other: Self) -> Self;
 
-    /// Round this value to the nearest integer.
+    /// Round to nearest integer with ties away from zero; preserve zero sign.
     fn round(self) -> Self;
 }
 
@@ -327,16 +277,16 @@ pub trait Real: Number + PartialOrd + opencl::CLElementReal {
     /// The minimum value of this data type.
     const MIN: Self;
 
-    /// Return the maximum of the given values.
+    /// Return the maximum; floating NaNs propagate and equal zeros select +0.
     fn max(l: Self, r: Self) -> Self;
 
-    /// Return the maximum of the given values.
+    /// Return the minimum; floating NaNs propagate and equal zeros select -0.
     fn min(l: Self, r: Self) -> Self;
 
     /// Compute the remainder of `self.div(other)`.
     fn rem(self, other: Self) -> Self;
 
-    /// Round this value to the nearest integer.
+    /// Round to nearest integer with ties away from zero; preserve zero sign.
     fn round(self) -> Self;
 }
 
@@ -372,16 +322,96 @@ macro_rules! real {
     };
 }
 
-real!(f32, Rem::rem, f32::total_cmp, f32::round);
-real!(f64, Rem::rem, f64::total_cmp, f64::round);
-real!(i8, Self::wrapping_rem, Ord::cmp, id);
-real!(i16, Self::wrapping_rem, Ord::cmp, id);
-real!(i32, Self::wrapping_rem, Ord::cmp, id);
-real!(i64, Self::wrapping_rem, Ord::cmp, id);
-real!(u8, Self::wrapping_rem, Ord::cmp, id);
-real!(u16, Self::wrapping_rem, Ord::cmp, id);
-real!(u32, Self::wrapping_rem, Ord::cmp, id);
-real!(u64, Self::wrapping_rem, Ord::cmp, id);
+macro_rules! real_float {
+    ($t:ty) => {
+        impl Real for $t {
+            const MAX: Self = <$t>::MAX;
+            const MIN: Self = <$t>::MIN;
+            fn max(l: Self, r: Self) -> Self {
+                if l.is_nan() || r.is_nan() {
+                    Self::NAN
+                } else if l == 0.0 && r == 0.0 {
+                    if l.is_sign_positive() || r.is_sign_positive() {
+                        0.0
+                    } else {
+                        -0.0
+                    }
+                } else {
+                    l.max(r)
+                }
+            }
+            fn min(l: Self, r: Self) -> Self {
+                if l.is_nan() || r.is_nan() {
+                    Self::NAN
+                } else if l == 0.0 && r == 0.0 {
+                    if l.is_sign_negative() || r.is_sign_negative() {
+                        -0.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    l.min(r)
+                }
+            }
+            fn rem(self, rhs: Self) -> Self {
+                self % rhs
+            }
+            fn round(self) -> Self {
+                <$t>::round(self)
+            }
+        }
+    };
+}
+real_float!(f32);
+real_float!(f64);
+real!(
+    i8,
+    |l, r| if r == 0 { 0 } else { Self::wrapping_rem(l, r) },
+    Ord::cmp,
+    id
+);
+real!(
+    i16,
+    |l, r| if r == 0 { 0 } else { Self::wrapping_rem(l, r) },
+    Ord::cmp,
+    id
+);
+real!(
+    i32,
+    |l, r| if r == 0 { 0 } else { Self::wrapping_rem(l, r) },
+    Ord::cmp,
+    id
+);
+real!(
+    i64,
+    |l, r| if r == 0 { 0 } else { Self::wrapping_rem(l, r) },
+    Ord::cmp,
+    id
+);
+real!(
+    u8,
+    |l, r| if r == 0 { 0 } else { Self::wrapping_rem(l, r) },
+    Ord::cmp,
+    id
+);
+real!(
+    u16,
+    |l, r| if r == 0 { 0 } else { Self::wrapping_rem(l, r) },
+    Ord::cmp,
+    id
+);
+real!(
+    u32,
+    |l, r| if r == 0 { 0 } else { Self::wrapping_rem(l, r) },
+    Ord::cmp,
+    id
+);
+real!(
+    u64,
+    |l, r| if r == 0 { 0 } else { Self::wrapping_rem(l, r) },
+    Ord::cmp,
+    id
+);
 
 #[cfg(not(feature = "opencl"))]
 /// A floating-point [`Number`]
@@ -544,9 +574,17 @@ macro_rules! float_type {
 }
 
 #[cfg(feature = "complex")]
-float_type!(complex::Complex32, |_| false, |_| false);
+float_type!(
+    complex::Complex32,
+    |n: complex::Complex32| n.re.is_infinite() || n.im.is_infinite(),
+    |n: complex::Complex32| n.re.is_nan() || n.im.is_nan()
+);
 #[cfg(feature = "complex")]
-float_type!(complex::Complex64, |_| false, |_| false);
+float_type!(
+    complex::Complex64,
+    |n: complex::Complex64| n.re.is_infinite() || n.im.is_infinite(),
+    |n: complex::Complex64| n.re.is_nan() || n.im.is_nan()
+);
 float_type!(f32, f32::is_infinite, f32::is_nan);
 float_type!(f64, f64::is_infinite, f64::is_nan);
 

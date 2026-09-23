@@ -62,6 +62,73 @@ fn complex_cmp(cmp: &'static str, cond: &'static str) -> String {
 }
 
 // TODO: can the `format!(...)` implementations be made static using const_format?
+fn cast_body(input: &'static str, output: &'static str) -> String {
+    fn scalar(input: &str, output: &str, value: &str) -> String {
+        let is_float = |t: &str| matches!(t, "float" | "double");
+        let is_signed = |t: &str| matches!(t, "char" | "short" | "int" | "long");
+        let unsigned = |t| match t {
+            "char" => "uchar",
+            "short" => "ushort",
+            "int" => "uint",
+            "long" => "ulong",
+            _ => t,
+        };
+        let signed = |t| match t {
+            "uchar" => "short",
+            "ushort" => "short",
+            "uint" => "int",
+            "ulong" => "long",
+            _ => t,
+        };
+        if is_float(input) && !is_float(output) {
+            let mid = match (input, is_signed(output)) {
+                ("float", true) => "int",
+                ("float", false) => "uint",
+                (_, true) => "long",
+                (_, false) => "ulong",
+            };
+            let converted = format!("(isnan({value}) ? ({mid})0 : convert_{mid}_sat_rtz({value}))");
+            return format!("convert_{output}({converted})");
+        }
+        if !is_float(input) && is_float(output) {
+            let mid = if matches!(input, "long" | "ulong") {
+                "double"
+            } else {
+                "float"
+            };
+            return format!("convert_{output}_rte(convert_{mid}_rte({value}))");
+        }
+        if !is_float(input) && !is_float(output) && is_signed(input) != is_signed(output) {
+            let mid = if is_signed(output) {
+                signed(input)
+            } else {
+                unsigned(input)
+            };
+            return format!("convert_{output}(convert_{mid}({value}))");
+        }
+        if is_float(output) {
+            format!("convert_{output}_rte({value})")
+        } else {
+            format!("convert_{output}({value})")
+        }
+    }
+    let input_complex = input.ends_with('2');
+    let output_complex = output.ends_with('2');
+    let it = input.trim_end_matches('2');
+    let ot = output.trim_end_matches('2');
+    let re = scalar(it, ot, if input_complex { "n.x" } else { "n" });
+    if output_complex {
+        let im = if input_complex {
+            scalar(it, ot, "n.y")
+        } else {
+            format!("({ot})0")
+        };
+        format!("return ({output})({re}, {im});")
+    } else {
+        format!("return {re};")
+    }
+}
+
 pub trait CLElement: OclPrm {
     const REAL: bool;
     const TYPE: &'static str;
@@ -109,7 +176,7 @@ pub trait CLElement: OclPrm {
 
     // boolean logic (unary)
     fn cl_not() -> ElementUnary {
-        ElementUnary::new::<Self, u8, _>("not", "return if (n == 0) { 1 } else { 0 };")
+        ElementUnary::new::<Self, u8, _>("not", "return n == 0 ? 1 : 0;")
     }
 
     // boolean logic (dual)
@@ -127,13 +194,7 @@ pub trait CLElement: OclPrm {
 
     // casting
     fn cl_cast<O: CLElement>() -> ElementUnary {
-        let op = match (Self::REAL, O::REAL) {
-            (true, true) | (false, false) => "return n;".to_string(),
-            (true, false) => format!("return ({})(n, 0.0);", O::TYPE),
-            (false, true) => format!("return ({}) n.x;", O::TYPE),
-        };
-
-        ElementUnary::new::<O, Self, _>("_cast", op)
+        ElementUnary::new::<Self, O, _>("_cast", cast_body(Self::TYPE, O::TYPE))
     }
 
     // comparison
@@ -181,7 +242,7 @@ pub trait CLElementReal: CLElement {
 
     // rounding
     fn cl_round() -> ElementUnary {
-        ElementUnary::new::<Self, Self, _>("_round", "return round(n));")
+        ElementUnary::new::<Self, Self, _>("_round", "return round(n);")
     }
 
     // comparison
@@ -202,11 +263,11 @@ pub trait CLElementReal: CLElement {
     }
 
     fn cl_max() -> ElementDual {
-        ElementDual::new::<Self, u8, _>("_max", "return max(lhs, rhs);")
+        ElementDual::new::<Self, Self, _>("_max", "return max(lhs, rhs);")
     }
 
     fn cl_min() -> ElementDual {
-        ElementDual::new::<Self, u8, _>("_min", "return min(lhs, rhs);")
+        ElementDual::new::<Self, Self, _>("_min", "return min(lhs, rhs);")
     }
 }
 
@@ -277,6 +338,14 @@ impl CLElement for f32 {
     const REAL: bool = true;
     const TYPE: &'static str = "float";
 
+    fn cl_abs() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_abs", "return fabs(n);")
+    }
+
+    fn cl_div() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("div", "return lhs / rhs;")
+    }
+
     fn cl_inf() -> ElementUnary {
         ElementUnary::new::<Self, u8, _>("_isinf", "return isinf(n);")
     }
@@ -287,6 +356,15 @@ impl CLElement for f32 {
 }
 
 impl CLElementReal for f32 {
+    fn cl_max() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("_max",
+            "if (isnan(lhs) || isnan(rhs)) return NAN; if (lhs == 0 && rhs == 0) return signbit(lhs) && signbit(rhs) ? -0.0f : 0.0f; return fmax(lhs, rhs);")
+    }
+    fn cl_min() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("_min",
+            "if (isnan(lhs) || isnan(rhs)) return NAN; if (lhs == 0 && rhs == 0) return signbit(lhs) || signbit(rhs) ? -0.0f : 0.0f; return fmin(lhs, rhs);")
+    }
+
     fn cl_rem() -> ElementDual {
         ElementDual::new::<Self, Self, _>("rem", "return fmod(lhs, rhs);")
     }
@@ -298,6 +376,14 @@ impl CLElement for f64 {
     const REAL: bool = true;
     const TYPE: &'static str = "double";
 
+    fn cl_abs() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_abs", "return fabs(n);")
+    }
+
+    fn cl_div() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("div", "return lhs / rhs;")
+    }
+
     fn cl_inf() -> ElementUnary {
         ElementUnary::new::<Self, u8, _>("_isinf", "return isinf(n);")
     }
@@ -308,6 +394,15 @@ impl CLElement for f64 {
 }
 
 impl CLElementReal for f64 {
+    fn cl_max() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("_max",
+            "if (isnan(lhs) || isnan(rhs)) return NAN; if (lhs == 0 && rhs == 0) return signbit(lhs) && signbit(rhs) ? -0.0f : 0.0f; return fmax(lhs, rhs);")
+    }
+    fn cl_min() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("_min",
+            "if (isnan(lhs) || isnan(rhs)) return NAN; if (lhs == 0 && rhs == 0) return signbit(lhs) || signbit(rhs) ? -0.0f : 0.0f; return fmin(lhs, rhs);")
+    }
+
     fn cl_rem() -> ElementDual {
         ElementDual::new::<Self, Self, _>("rem", "return fmod(lhs, rhs);")
     }
@@ -318,58 +413,327 @@ cl_trig_real!(f64);
 impl CLElement for i8 {
     const REAL: bool = true;
     const TYPE: &'static str = "char";
+    fn cl_add() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "add",
+            "return as_char((uchar)((ulong)(uchar)lhs + (ulong)(uchar)rhs));",
+        )
+    }
+    fn cl_sub() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "sub",
+            "return as_char((uchar)((ulong)(uchar)lhs - (ulong)(uchar)rhs));",
+        )
+    }
+    fn cl_mul() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "mul",
+            "return as_char((uchar)((ulong)(uchar)lhs * (ulong)(uchar)rhs));",
+        )
+    }
+    fn cl_div() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("div", "if (rhs == 0) return 0; if (lhs == ((char)(((uchar)1) << 7)) && rhs == -1) return lhs; return lhs / rhs;")
+    }
+    fn cl_pow() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("_pow", "if (rhs < 0) { if (lhs == 1) return 1; if (lhs == -1) return (rhs & 1) ? -1 : 1; return 0; } ulong b = (uchar)lhs; ulong e = (uchar)rhs; ulong r = 1; while (e != 0) { if (e & 1) r *= b; e >>= 1; b *= b; } return as_char((uchar)(r));")
+    }
+    fn cl_abs() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>(
+            "_abs",
+            "return n < 0 ? as_char((uchar)(0UL - (ulong)(uchar)n)) : n;",
+        )
+    }
 }
-
-impl CLElementReal for i8 {}
-
+impl CLElementReal for i8 {
+    fn cl_rem() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("rem", "if (rhs == 0) return 0; if (lhs == ((char)(((uchar)1) << 7)) && rhs == -1) return 0; return lhs % rhs;")
+    }
+    fn cl_round() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_round", "return n;")
+    }
+}
 impl CLElement for i16 {
     const REAL: bool = true;
     const TYPE: &'static str = "short";
+    fn cl_add() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "add",
+            "return as_short((ushort)((ulong)(ushort)lhs + (ulong)(ushort)rhs));",
+        )
+    }
+    fn cl_sub() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "sub",
+            "return as_short((ushort)((ulong)(ushort)lhs - (ulong)(ushort)rhs));",
+        )
+    }
+    fn cl_mul() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "mul",
+            "return as_short((ushort)((ulong)(ushort)lhs * (ulong)(ushort)rhs));",
+        )
+    }
+    fn cl_div() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("div", "if (rhs == 0) return 0; if (lhs == ((short)(((ushort)1) << 15)) && rhs == -1) return lhs; return lhs / rhs;")
+    }
+    fn cl_pow() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("_pow", "if (rhs < 0) { if (lhs == 1) return 1; if (lhs == -1) return (rhs & 1) ? -1 : 1; return 0; } ulong b = (ushort)lhs; ulong e = (ushort)rhs; ulong r = 1; while (e != 0) { if (e & 1) r *= b; e >>= 1; b *= b; } return as_short((ushort)(r));")
+    }
+    fn cl_abs() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>(
+            "_abs",
+            "return n < 0 ? as_short((ushort)(0UL - (ulong)(ushort)n)) : n;",
+        )
+    }
 }
-
-impl CLElementReal for i16 {}
-
+impl CLElementReal for i16 {
+    fn cl_rem() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("rem", "if (rhs == 0) return 0; if (lhs == ((short)(((ushort)1) << 15)) && rhs == -1) return 0; return lhs % rhs;")
+    }
+    fn cl_round() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_round", "return n;")
+    }
+}
 impl CLElement for i32 {
     const REAL: bool = true;
     const TYPE: &'static str = "int";
+    fn cl_add() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "add",
+            "return as_int((uint)((ulong)(uint)lhs + (ulong)(uint)rhs));",
+        )
+    }
+    fn cl_sub() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "sub",
+            "return as_int((uint)((ulong)(uint)lhs - (ulong)(uint)rhs));",
+        )
+    }
+    fn cl_mul() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "mul",
+            "return as_int((uint)((ulong)(uint)lhs * (ulong)(uint)rhs));",
+        )
+    }
+    fn cl_div() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("div", "if (rhs == 0) return 0; if (lhs == ((int)(((uint)1) << 31)) && rhs == -1) return lhs; return lhs / rhs;")
+    }
+    fn cl_pow() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("_pow", "if (rhs < 0) { if (lhs == 1) return 1; if (lhs == -1) return (rhs & 1) ? -1 : 1; return 0; } ulong b = (uint)lhs; ulong e = (uint)rhs; ulong r = 1; while (e != 0) { if (e & 1) r *= b; e >>= 1; b *= b; } return as_int((uint)(r));")
+    }
+    fn cl_abs() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>(
+            "_abs",
+            "return n < 0 ? as_int((uint)(0UL - (ulong)(uint)n)) : n;",
+        )
+    }
 }
-
-impl CLElementReal for i32 {}
-
+impl CLElementReal for i32 {
+    fn cl_rem() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("rem", "if (rhs == 0) return 0; if (lhs == ((int)(((uint)1) << 31)) && rhs == -1) return 0; return lhs % rhs;")
+    }
+    fn cl_round() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_round", "return n;")
+    }
+}
 impl CLElement for i64 {
     const REAL: bool = true;
     const TYPE: &'static str = "long";
+    fn cl_add() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "add",
+            "return as_long((ulong)((ulong)(ulong)lhs + (ulong)(ulong)rhs));",
+        )
+    }
+    fn cl_sub() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "sub",
+            "return as_long((ulong)((ulong)(ulong)lhs - (ulong)(ulong)rhs));",
+        )
+    }
+    fn cl_mul() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "mul",
+            "return as_long((ulong)((ulong)(ulong)lhs * (ulong)(ulong)rhs));",
+        )
+    }
+    fn cl_div() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("div", "if (rhs == 0) return 0; if (lhs == ((long)(((ulong)1) << 63)) && rhs == -1) return lhs; return lhs / rhs;")
+    }
+    fn cl_pow() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("_pow", "if (rhs < 0) { if (lhs == 1) return 1; if (lhs == -1) return (rhs & 1) ? -1 : 1; return 0; } ulong b = (ulong)lhs; ulong e = (ulong)rhs; ulong r = 1; while (e != 0) { if (e & 1) r *= b; e >>= 1; b *= b; } return as_long((ulong)(r));")
+    }
+    fn cl_abs() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>(
+            "_abs",
+            "return n < 0 ? as_long((ulong)(0UL - (ulong)(ulong)n)) : n;",
+        )
+    }
 }
-
-impl CLElementReal for i64 {}
-
+impl CLElementReal for i64 {
+    fn cl_rem() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("rem", "if (rhs == 0) return 0; if (lhs == ((long)(((ulong)1) << 63)) && rhs == -1) return 0; return lhs % rhs;")
+    }
+    fn cl_round() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_round", "return n;")
+    }
+}
 impl CLElement for u8 {
     const REAL: bool = true;
     const TYPE: &'static str = "uchar";
+    fn cl_add() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "add",
+            "return (uchar)((ulong)(uchar)lhs + (ulong)(uchar)rhs);",
+        )
+    }
+    fn cl_sub() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "sub",
+            "return (uchar)((ulong)(uchar)lhs - (ulong)(uchar)rhs);",
+        )
+    }
+    fn cl_mul() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "mul",
+            "return (uchar)((ulong)(uchar)lhs * (ulong)(uchar)rhs);",
+        )
+    }
+    fn cl_div() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("div", "if (rhs == 0) return 0;  return lhs / rhs;")
+    }
+    fn cl_pow() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("_pow", " ulong b = (uchar)lhs; ulong e = (uchar)rhs; ulong r = 1; while (e != 0) { if (e & 1) r *= b; e >>= 1; b *= b; } return (uchar)(r);")
+    }
+    fn cl_abs() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_abs", "return n;")
+    }
 }
-
-impl CLElementReal for u8 {}
-
+impl CLElementReal for u8 {
+    fn cl_rem() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("rem", "if (rhs == 0) return 0;  return lhs % rhs;")
+    }
+    fn cl_round() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_round", "return n;")
+    }
+}
 impl CLElement for u16 {
     const REAL: bool = true;
     const TYPE: &'static str = "ushort";
+    fn cl_add() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "add",
+            "return (ushort)((ulong)(ushort)lhs + (ulong)(ushort)rhs);",
+        )
+    }
+    fn cl_sub() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "sub",
+            "return (ushort)((ulong)(ushort)lhs - (ulong)(ushort)rhs);",
+        )
+    }
+    fn cl_mul() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "mul",
+            "return (ushort)((ulong)(ushort)lhs * (ulong)(ushort)rhs);",
+        )
+    }
+    fn cl_div() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("div", "if (rhs == 0) return 0;  return lhs / rhs;")
+    }
+    fn cl_pow() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("_pow", " ulong b = (ushort)lhs; ulong e = (ushort)rhs; ulong r = 1; while (e != 0) { if (e & 1) r *= b; e >>= 1; b *= b; } return (ushort)(r);")
+    }
+    fn cl_abs() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_abs", "return n;")
+    }
 }
-
-impl CLElementReal for u16 {}
-
+impl CLElementReal for u16 {
+    fn cl_rem() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("rem", "if (rhs == 0) return 0;  return lhs % rhs;")
+    }
+    fn cl_round() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_round", "return n;")
+    }
+}
 impl CLElement for u32 {
     const REAL: bool = true;
     const TYPE: &'static str = "uint";
+    fn cl_add() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "add",
+            "return (uint)((ulong)(uint)lhs + (ulong)(uint)rhs);",
+        )
+    }
+    fn cl_sub() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "sub",
+            "return (uint)((ulong)(uint)lhs - (ulong)(uint)rhs);",
+        )
+    }
+    fn cl_mul() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "mul",
+            "return (uint)((ulong)(uint)lhs * (ulong)(uint)rhs);",
+        )
+    }
+    fn cl_div() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("div", "if (rhs == 0) return 0;  return lhs / rhs;")
+    }
+    fn cl_pow() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("_pow", " ulong b = (uint)lhs; ulong e = (uint)rhs; ulong r = 1; while (e != 0) { if (e & 1) r *= b; e >>= 1; b *= b; } return (uint)(r);")
+    }
+    fn cl_abs() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_abs", "return n;")
+    }
 }
-
-impl CLElementReal for u32 {}
-
+impl CLElementReal for u32 {
+    fn cl_rem() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("rem", "if (rhs == 0) return 0;  return lhs % rhs;")
+    }
+    fn cl_round() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_round", "return n;")
+    }
+}
 impl CLElement for u64 {
     const REAL: bool = true;
     const TYPE: &'static str = "ulong";
+    fn cl_add() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "add",
+            "return (ulong)((ulong)(ulong)lhs + (ulong)(ulong)rhs);",
+        )
+    }
+    fn cl_sub() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "sub",
+            "return (ulong)((ulong)(ulong)lhs - (ulong)(ulong)rhs);",
+        )
+    }
+    fn cl_mul() -> ElementDual {
+        ElementDual::new::<Self, Self, _>(
+            "mul",
+            "return (ulong)((ulong)(ulong)lhs * (ulong)(ulong)rhs);",
+        )
+    }
+    fn cl_div() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("div", "if (rhs == 0) return 0;  return lhs / rhs;")
+    }
+    fn cl_pow() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("_pow", " ulong b = (ulong)lhs; ulong e = (ulong)rhs; ulong r = 1; while (e != 0) { if (e & 1) r *= b; e >>= 1; b *= b; } return (ulong)(r);")
+    }
+    fn cl_abs() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_abs", "return n;")
+    }
 }
-
-impl CLElementReal for u64 {}
+impl CLElementReal for u64 {
+    fn cl_rem() -> ElementDual {
+        ElementDual::new::<Self, Self, _>("rem", "if (rhs == 0) return 0;  return lhs % rhs;")
+    }
+    fn cl_round() -> ElementUnary {
+        ElementUnary::new::<Self, Self, _>("_round", "return n;")
+    }
+}
 
 #[cfg(feature = "complex")]
 macro_rules! cl_complex {
@@ -378,6 +742,12 @@ macro_rules! cl_complex {
             const REAL: bool = false;
             const TYPE: &'static str = $ct;
 
+            fn cl_not() -> ElementUnary {
+                ElementUnary::new::<Self, u8, _>("not", "return n.x == 0 && n.y == 0;")
+            }
+            fn cl_abs() -> ElementUnary {
+                ElementUnary::new::<Self, $t, _>("_abs", "return hypot(n.x, n.y);")
+            }
             // basic arithmetic (dual)
             fn cl_div() -> ElementDual {
                 ElementDual::new::<Self, Self, _>(
@@ -385,7 +755,7 @@ macro_rules! cl_complex {
                     format!(
                         "
                         if (rhs.x == 0.0f && rhs.y == 0.0f) {{
-                            return ({c_type})(0.0f, 0.0f);
+                            return ({c_type})(NAN, NAN);
                         }} else {{
                             {r_type} denom = (rhs.x * rhs.x) + (rhs.y * rhs.y);
                             {r_type} re = ((lhs.x * rhs.x) + (lhs.y * rhs.y)) / denom;
@@ -414,13 +784,24 @@ macro_rules! cl_complex {
                 )
             }
 
+            fn cl_log() -> ElementDual {
+                ElementDual::new::<Self, Self, _>("_log", format!(
+                    "{r} a = log(hypot(lhs.x, lhs.y)); {r} b = atan2(lhs.y, lhs.x);
+                     {r} c = log(hypot(rhs.x, rhs.y)); {r} d = atan2(rhs.y, rhs.x);
+                     {r} denom = c*c + d*d;
+                     return ({ct})((a*c+b*d)/denom, (b*c-a*d)/denom);",
+                    r=<$t>::TYPE, ct=Self::TYPE
+                ))
+            }
+
             fn cl_pow() -> ElementDual {
                 ElementDual::new::<Self, Self, _>(
                     "_pow",
                     format!(
                         "
+                        if (rhs.x == 0 && rhs.y == 0) return ({c_type})(1, 0);
                         // log_lhs = log(lhs)
-                        {r_type} norm = sqrt(pow(lhs.x, 2) + pow(lhs.y, 2));
+                        {r_type} norm = hypot(lhs.x, lhs.y);
                         {r_type} angle = atan2(lhs.y, lhs.x);
                         {c_type} log_lhs = ({c_type})(log(norm), angle);
 
@@ -428,6 +809,11 @@ macro_rules! cl_complex {
                         {r_type} product_r = ((rhs.x * log_lhs.x) - (rhs.y * log_lhs.y));
                         {r_type} product_i = ((rhs.x * log_lhs.y) + (rhs.y * log_lhs.x));
 
+                        if (isinf(product_r)) {{
+                            if (product_r < 0 && !isfinite(product_i)) return ({c_type})(0, 0);
+                            if (product_r > 0 && (product_i == 0 || !isfinite(product_i)))
+                                return ({c_type})(product_r, isinf(product_i) ? NAN : product_i);
+                        }} else if (isnan(product_r) && product_i == 0) return ({c_type})(product_r, product_i);
                         // return exp(product)
                         {r_type} r = exp(product_r);
                         {c_type} c = ({c_type})(cos(product_i), sin(product_i));
@@ -443,18 +829,16 @@ macro_rules! cl_complex {
             }
 
             // basic arithmetic (unary)
-            fn cl_abs() -> ElementUnary {
-                ElementUnary::new::<Self, Self, _>(
-                    "_abs",
-                    "return sqrt(pow(n.x, 2) + pow(n.y, 2));",
-                )
-            }
-
             fn cl_exp() -> ElementUnary {
                 ElementUnary::new::<Self, Self, _>(
                     "_exp",
                     format!(
                         "
+if (isinf(n.x)) {{
+                            if (n.x < 0 && !isfinite(n.y)) return ({c_type})(0, 0);
+                            if (n.x > 0 && (n.y == 0 || !isfinite(n.y)))
+                                return ({c_type})(n.x, isinf(n.y) ? NAN : n.y);
+                        }} else if (isnan(n.x) && n.y == 0) return ({c_type})(n.x, n.y);
                         {r_type} lhs = exp(n.x);
                         {c_type} rhs = ({c_type})(cos(n.y), sin(n.y));
 
@@ -473,7 +857,7 @@ macro_rules! cl_complex {
                     "ln",
                     format!(
                         "
-                        {r_type} norm = sqrt(pow(n.x, 2) + pow(n.y, 2));
+                        {r_type} norm = hypot(n.x, n.y);
                         {r_type} angle = atan2(n.y, n.x);
                         return ({c_type})(log(norm), angle);
                         ",
@@ -515,7 +899,11 @@ macro_rules! cl_complex {
             }
         }
 
-        impl CLElementComplex for num_complex::Complex<$t> {}
+        impl CLElementComplex for num_complex::Complex<$t> {
+            fn cl_angle() -> ElementUnary { ElementUnary::new::<Self, $t, _>("angle", "return atan2(n.y, n.x);") }
+            fn cl_real() -> ElementUnary { ElementUnary::new::<Self, $t, _>("real", "return n.x;") }
+            fn cl_imag() -> ElementUnary { ElementUnary::new::<Self, $t, _>("imag", "return n.y;") }
+        }
     };
 }
 
@@ -554,33 +942,34 @@ macro_rules! cl_trig_complex {
 
                         // z^2
                         {r_type} z2_re = (a * a) - (b * b);
-                        {r_type} z2_im = ({r_type})2.0f * a * b;
+                        {r_type} z2_im = a * b + b * a;
 
                         // w = 1 - z^2
                         {r_type} w_re = ({r_type})1.0f - z2_re;
-                        {r_type} w_im = -z2_im;
+                        {r_type} w_im = ({r_type})0 - z2_im;
 
                         // sqrt(w)
-                        {r_type} w_norm = sqrt((w_re * w_re) + (w_im * w_im));
-                        {r_type} sqrt_re = sqrt((w_norm + w_re) * ({r_type})0.5f);
-                        {r_type} sqrt_im = sqrt(fmax((w_norm - w_re) * ({r_type})0.5f, ({r_type})0.0f));
-                        sqrt_im = (w_im < ({r_type})0.0f) ? -sqrt_im : sqrt_im;
+                        {r_type} w_norm = hypot(w_re, w_im);
+                        // Avoid cancellation in the small component of sqrt(w).
+                        {r_type} t = sqrt((w_norm + fabs(w_re)) * ({r_type})0.5f);
+                        {r_type} sqrt_re = w_re >= 0 ? t : (t == 0 ? 0 : fabs(w_im) / (2*t));
+                        {r_type} sqrt_im = w_re >= 0 ? (t == 0 ? w_im : w_im / (2*t)) : copysign(t, w_im);
 
                         // i z
-                        {r_type} iz_re = -b;
-                        {r_type} iz_im = a;
+                        {r_type} iz_re = ({r_type})0 * a - b;
+                        {r_type} iz_im = ({r_type})0 * b + a;
 
                         // i z + sqrt(1 - z^2)
                         {r_type} s_re = iz_re + sqrt_re;
                         {r_type} s_im = iz_im + sqrt_im;
 
                         // log(s)
-                        {r_type} s_norm = sqrt((s_re * s_re) + (s_im * s_im));
+                        {r_type} s_norm = hypot(s_re, s_im);
                         {r_type} log_re = log(s_norm);
                         {r_type} log_im = atan2(s_im, s_re);
 
-                        // -i * log(s)
-                        return ({c_type})(log_im, -log_re);
+                        // -i * log(s); -i has a negative-zero real component.
+                        return ({c_type})(({r_type})(-0.0f) * log_re + log_im, ({r_type})(-0.0f) * log_im - log_re);
                         ",
                         c_type = Self::TYPE,
                         r_type = <$r>::TYPE,
@@ -629,33 +1018,34 @@ macro_rules! cl_trig_complex {
 
                         // z^2
                         {r_type} z2_re = (a * a) - (b * b);
-                        {r_type} z2_im = ({r_type})2.0f * a * b;
+                        {r_type} z2_im = a * b + b * a;
 
                         // w = 1 - z^2
                         {r_type} w_re = ({r_type})1.0f - z2_re;
-                        {r_type} w_im = -z2_im;
+                        {r_type} w_im = ({r_type})0 - z2_im;
 
                         // sqrt(w)
-                        {r_type} w_norm = sqrt((w_re * w_re) + (w_im * w_im));
-                        {r_type} sqrt_re = sqrt((w_norm + w_re) * ({r_type})0.5f);
-                        {r_type} sqrt_im = sqrt(fmax((w_norm - w_re) * ({r_type})0.5f, ({r_type})0.0f));
-                        sqrt_im = (w_im < ({r_type})0.0f) ? -sqrt_im : sqrt_im;
+                        {r_type} w_norm = hypot(w_re, w_im);
+                        // Avoid cancellation in the small component of sqrt(w).
+                        {r_type} t = sqrt((w_norm + fabs(w_re)) * ({r_type})0.5f);
+                        {r_type} sqrt_re = w_re >= 0 ? t : (t == 0 ? 0 : fabs(w_im) / (2*t));
+                        {r_type} sqrt_im = w_re >= 0 ? (t == 0 ? w_im : w_im / (2*t)) : copysign(t, w_im);
 
                         // i * sqrt(w) = (-sqrt_im) + i * sqrt_re
-                        {r_type} iz_re = -sqrt_im;
-                        {r_type} iz_im = sqrt_re;
+                        {r_type} iz_re = ({r_type})0 * sqrt_re - sqrt_im;
+                        {r_type} iz_im = ({r_type})0 * sqrt_im + sqrt_re;
 
                         // z + i * sqrt(1 - z^2)
                         {r_type} s_re = a + iz_re;
                         {r_type} s_im = b + iz_im;
 
                         // log(s)
-                        {r_type} s_norm = sqrt((s_re * s_re) + (s_im * s_im));
+                        {r_type} s_norm = hypot(s_re, s_im);
                         {r_type} log_re = log(s_norm);
                         {r_type} log_im = atan2(s_im, s_re);
 
-                        // -i * log(s)
-                        return ({c_type})(log_im, -log_re);
+                        // -i * log(s); -i has a negative-zero real component.
+                        return ({c_type})(({r_type})(-0.0f) * log_re + log_im, ({r_type})(-0.0f) * log_im - log_re);
                         ",
                         c_type = Self::TYPE,
                         r_type = <$r>::TYPE,
@@ -703,32 +1093,33 @@ macro_rules! cl_trig_complex {
                     "_atan",
                     format!(
                         "
+                        if (n.x == 0 && fabs(n.y) == 1) return ({c_type})(0, copysign(({r_type})INFINITY, n.y));
                         // atan(z) = (i / 2) * (log(1 - i z) - log(1 + i z))
                         {r_type} a = n.x;
                         {r_type} b = n.y;
 
                         // 1 - i z = (1 + b) - i a
-                        {r_type} w1_re = ({r_type})1.0f + b;
-                        {r_type} w1_im = -a;
+                        {r_type} w1_re = ({r_type})1 - (({r_type})0 * a - b);
+                        {r_type} w1_im = ({r_type})0 - (({r_type})0 * b + a);
 
                         // 1 + i z = (1 - b) + i a
-                        {r_type} w2_re = ({r_type})1.0f - b;
-                        {r_type} w2_im = a;
+                        {r_type} w2_re = ({r_type})1 + (({r_type})0 * a - b);
+                        {r_type} w2_im = ({r_type})0 + (({r_type})0 * b + a);
 
-                        {r_type} w1_norm = sqrt((w1_re * w1_re) + (w1_im * w1_im));
+                        {r_type} w1_norm = hypot(w1_re, w1_im);
                         {r_type} u1 = log(w1_norm);
                         {r_type} v1 = atan2(w1_im, w1_re);
 
-                        {r_type} w2_norm = sqrt((w2_re * w2_re) + (w2_im * w2_im));
+                        {r_type} w2_norm = hypot(w2_re, w2_im);
                         {r_type} u2 = log(w2_norm);
                         {r_type} v2 = atan2(w2_im, w2_re);
 
-                        // diff = (u1 - u2) + i (v1 - v2)
-                        {r_type} p = u1 - u2;
-
-                        // (i / 2) * (p + i q) = (-q / 2) + i (p / 2)
-                        {r_type} re = (v2 - v1) * ({r_type})0.5f;
-                        {r_type} im = p * ({r_type})0.5f;
+                        // Divide log(1+iz)-log(1-iz) by 2i, retaining num-complex's
+                        // zero products and exceptional-value conventions.
+                        {r_type} p = u2 - u1;
+                        {r_type} q = v2 - v1;
+                        {r_type} re = (p * ({r_type})0 + q * ({r_type})2) / ({r_type})4;
+                        {r_type} im = (q * ({r_type})0 - p * ({r_type})2) / ({r_type})4;
                         return ({c_type})(re, im);
                         ",
                         c_type = Self::TYPE,

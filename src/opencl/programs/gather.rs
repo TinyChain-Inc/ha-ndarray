@@ -1,5 +1,5 @@
+use super::Program;
 use memoize::memoize;
-use ocl::Program;
 
 use crate::Error;
 
@@ -26,5 +26,5 @@ pub fn gather_cond(c_type: &'static str) -> Result<Program, Error> {
         "#,
     );
 
-    build(&src)
+    build(&src, &[c_type], "gather")
 }

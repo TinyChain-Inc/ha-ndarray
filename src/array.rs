@@ -67,11 +67,11 @@ impl<T, A, P> Array<T, A, P> {
         axes.dedup();
 
         let platform = P::select(self.size());
-        let stride = axes.iter().copied().map(|x| self.shape[x]).product();
         let shape = reduce_axes(&self.shape, &axes, keepdims)?;
+        let stride = axes.iter().copied().map(|x| self.shape[x]).product();
 
-        let access = permute_for_reduce(self.platform, self.access, self.shape, axes)?;
-        let access = (op)(self.platform, access, stride)?;
+        let access = permute_for_reduce(platform, self.access, self.shape, axes)?;
+        let access = (op)(platform, access, stride)?;
 
         Ok(Array {
             access,
@@ -361,6 +361,7 @@ impl<P: PlatformInstance> Array<f32, AccessOp<P::Normal, P>, P>
 where
     P: Random,
 {
+    /// Sample finite standard-normal f32 values. Sequences are backend-dependent.
     pub fn random_normal(size: usize) -> Result<Self, Error> {
         let platform = P::select(size);
         let shape = shape![size];
@@ -378,6 +379,7 @@ impl<P: PlatformInstance> Array<f32, AccessOp<P::Uniform, P>, P>
 where
     P: Random,
 {
+    /// Sample uniform f32 values in [0, 1). Sequences are backend-dependent.
     pub fn random_uniform(size: usize) -> Result<Self, Error> {
         let platform = P::select(size);
         let shape = shape![size];
@@ -1293,14 +1295,16 @@ where
         self,
     ) -> Result<Array<<Self::DType as Complex>::Real, Self::Real, Self::Platform>, Error>;
 
-    /// Calculate the angle in the complex plane elementwise.
+    /// Return the complex conjugate elementwise.
     fn conj(self) -> Result<Array<Self::DType, Self::Complex, Self::Platform>, Error>;
 
     /// Return the real part of this array elementwise.
-    fn re(self) -> Result<Array<Self::DType, Self::Real, Self::Platform>, Error>;
+    fn re(self)
+        -> Result<Array<<Self::DType as Complex>::Real, Self::Real, Self::Platform>, Error>;
 
     /// Return the imaginary part of this array elementwise.
-    fn im(self) -> Result<Array<Self::DType, Self::Real, Self::Platform>, Error>;
+    fn im(self)
+        -> Result<Array<<Self::DType as Complex>::Real, Self::Real, Self::Platform>, Error>;
 }
 
 #[cfg(feature = "complex")]
@@ -1321,11 +1325,15 @@ where
         self.apply(|platform, access| platform.conj(access))
     }
 
-    fn re(self) -> Result<Array<Self::DType, Self::Real, Self::Platform>, Error> {
+    fn re(
+        self,
+    ) -> Result<Array<<Self::DType as Complex>::Real, Self::Real, Self::Platform>, Error> {
         self.apply(|platform, access| platform.re(access))
     }
 
-    fn im(self) -> Result<Array<Self::DType, Self::Real, Self::Platform>, Error> {
+    fn im(
+        self,
+    ) -> Result<Array<<Self::DType as Complex>::Real, Self::Real, Self::Platform>, Error> {
         self.apply(|platform, access| platform.im(access))
     }
 }
@@ -1341,7 +1349,7 @@ where
     /// Calculate the Fourier transform of the last dimension of this array.
     fn fft(self) -> Result<Array<Self::DType, Self::Output, Self::Platform>, Error>;
 
-    /// Calculate the Fourier transform of the last dimension of this array.
+    /// Calculate the unnormalized inverse Fourier transform of each last-axis batch.
     fn ifft(self) -> Result<Array<Self::DType, Self::Output, Self::Platform>, Error>;
 }
 
@@ -1548,13 +1556,7 @@ where
         self,
         rhs: Self::DType,
     ) -> Result<Array<Self::DType, Self::Output, Self::Platform>, Error> {
-        if rhs == T::ZERO {
-            Err(Error::unsupported(format!(
-                "cannot divide {self:?} by {rhs}"
-            )))
-        } else {
-            self.apply(|platform, left| platform.div_scalar(left, rhs))
-        }
+        self.apply(|platform, left| platform.div_scalar(left, rhs))
     }
 
     fn log_scalar(
@@ -2085,4 +2087,54 @@ fn valid_coord(coord: &[usize], shape: &[usize]) -> Result<(), Error> {
     Err(Error::bounds(format!(
         "invalid coordinate {coord:?} for shape {shape:?}"
     )))
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    #[test]
+    fn reduction_reselects_host_for_workload_size() {
+        for size in [8, crate::host::VEC_MIN_SIZE] {
+            let source =
+                crate::host::ArrayBuf::new(vec![1u32; size].into(), shape![2, size / 2]).unwrap();
+            let mut source = ArrayAccess::from(source);
+            // Simulate an inherited platform chosen for a different workload.
+            source.platform = Platform::Host(if size < crate::host::VEC_MIN_SIZE {
+                crate::host::Host::Heap(crate::host::Heap)
+            } else {
+                crate::host::Host::Stack(crate::host::Stack)
+            });
+            let result = source.sum(axes![0], false).unwrap();
+            assert_eq!(result.platform, Platform::select(size));
+            assert!(matches!(result.buffer().unwrap(), BufferConverter::Host(_)));
+            assert_eq!(
+                result.buffer().unwrap().to_slice().unwrap().as_ref(),
+                vec![2u32; size / 2]
+            );
+        }
+    }
+
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn reduction_reselects_backend_and_accessor_together() {
+        for size in [8, crate::opencl::GPU_MIN_SIZE] {
+            let source =
+                crate::host::ArrayBuf::new(vec![1u32; size].into(), shape![2, size / 2]).unwrap();
+            let mut source = ArrayAccess::from(source);
+            source.platform = if size < crate::opencl::GPU_MIN_SIZE {
+                Platform::CL(crate::opencl::OpenCL)
+            } else {
+                Platform::Host(crate::host::Host::Heap(crate::host::Heap))
+            };
+            let result = source.sum(axes![0], false).unwrap();
+            assert_eq!(result.platform, Platform::select(size));
+            let buffer = result.buffer().unwrap();
+            assert_eq!(
+                matches!(buffer, BufferConverter::CL(_)),
+                size >= crate::opencl::GPU_MIN_SIZE
+            );
+            assert_eq!(buffer.to_slice().unwrap().as_ref(), vec![2u32; size / 2]);
+        }
+    }
 }

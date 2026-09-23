@@ -1,5 +1,5 @@
+use super::Program;
 use memoize::memoize;
-use ocl::Program;
 
 use crate::Error;
 
@@ -10,17 +10,18 @@ pub fn diagonal(c_type: &'static str) -> Result<Program, Error> {
     let src = format!(
         r#"
         __kernel void diagonal(
-            const {c_type}* restrict matrices,
-            {c_type}* restrict diagonals)
+            const ulong dim,
+            __global const {c_type}* restrict matrices,
+            __global {c_type}* restrict diagonals)
         {{
             const ulong m = get_global_id(0);
             const ulong i = get_global_id(1);
-            diagonals[m, i] = matrices[m, i, i];
+            diagonals[m * dim + i] = matrices[m * dim * dim + i * dim + i];
         }}
         "#,
     );
 
-    build(&src)
+    build(&src, &[c_type], "linalg")
 }
 
 #[memoize]
@@ -46,21 +47,23 @@ pub fn pad_matrices(c_type: &'static str) -> Result<Program, Error> {
     "#
     );
 
-    build(&src)
+    build(&src, &[c_type], "linalg")
 }
 
 #[memoize]
-pub fn matmul(mul: ElementDual) -> Result<Program, Error> {
+pub fn matmul(mul: ElementDual, add: ElementDual) -> Result<Program, Error> {
     debug_assert_eq!(TILE_SIZE * TILE_SIZE, WG_SIZE);
 
     let i_type = mul.i_type;
     let o_type = mul.o_type;
     let name = mul.name;
     let op = mul.build();
+    let add = add.build();
 
     let src = format!(
         r#"
         {op}
+        {add}
 
         __kernel void matmul(
                 ulong4 const dims,
@@ -113,7 +116,7 @@ pub fn matmul(mul: ElementDual) -> Result<Program, Error> {
                     for (uint j = 0; j < {TILE_SIZE}; j++) {{
                         #pragma unroll
                         for (uint k = 0; k < {TILE_SIZE}; k++) {{
-                            tile[i][k] += {name}(left_tile[i][j], right_tile[j][k]);
+                            tile[i][k] = add(tile[i][k], {name}(left_tile[i][j], right_tile[j][k]));
                         }}
                     }}
                 }}
@@ -136,5 +139,5 @@ pub fn matmul(mul: ElementDual) -> Result<Program, Error> {
         "#,
     );
 
-    build(&src)
+    build(&src, &[i_type, o_type], "linalg")
 }

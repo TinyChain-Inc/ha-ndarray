@@ -674,13 +674,13 @@ impl Random for OpenCL {
 impl<A: Access<T>, T: Number> ReduceAll<A, T> for OpenCL {
     fn all(self, access: A) -> Result<bool, Error> {
         let input = access.read()?.to_cl()?;
-        let result = reduce_all::<T>(&*input, T::cl_and(), T::ONE)?;
+        let result = reduce_all::<T>(&*input, T::cl_and().into_reduction(), T::ONE)?;
         Ok(result.into_par_iter().all(|n| n != T::ZERO))
     }
 
     fn any(self, access: A) -> Result<bool, Error> {
         let input = access.read()?.to_cl()?;
-        let result = reduce_all::<T>(&*input, T::cl_or(), T::ZERO)?;
+        let result = reduce_all::<T>(&*input, T::cl_or().into_reduction(), T::ZERO)?;
         Ok(result.into_par_iter().any(|n| n != T::ZERO))
     }
 
@@ -689,8 +689,10 @@ impl<A: Access<T>, T: Number> ReduceAll<A, T> for OpenCL {
         T: Real,
     {
         let input = access.read()?.to_cl()?;
-        let result = reduce_all::<T>(&*input, T::cl_max(), T::MIN)?;
-        Ok(result.into_par_iter().reduce(|| T::MIN, T::max))
+        let result = reduce_all::<T>(&*input, T::cl_max(), crate::numeric::minimum::<T>())?;
+        Ok(result
+            .into_par_iter()
+            .reduce(|| crate::numeric::minimum::<T>(), T::max))
     }
 
     fn min(self, access: A) -> Result<T, Error>
@@ -698,8 +700,10 @@ impl<A: Access<T>, T: Number> ReduceAll<A, T> for OpenCL {
         T: Real,
     {
         let input = access.read()?.to_cl()?;
-        let result = reduce_all::<T>(&*input, T::cl_min(), T::MAX)?;
-        Ok(result.into_par_iter().reduce(|| T::MAX, T::min))
+        let result = reduce_all::<T>(&*input, T::cl_min(), crate::numeric::maximum::<T>())?;
+        Ok(result
+            .into_par_iter()
+            .reduce(|| crate::numeric::maximum::<T>(), T::min))
     }
 
     fn product(self, access: A) -> Result<T, Error> {
@@ -808,11 +812,12 @@ fn reduce_all<T: Number>(input: &Buffer<T>, reduce: ElementDual, id: T) -> Resul
 
         let kernel = Kernel::builder()
             .name("reduce")
-            .program(&program)
+            .program(&program.for_queue(&queue)?)
             .queue(queue.clone())
             .local_work_size(WG_SIZE)
             .global_work_size(WG_SIZE * output.len())
             .arg(input.len() as u64)
+            .arg(id)
             .arg(input)
             .arg(&output)
             .arg_local::<T>(WG_SIZE)
@@ -836,11 +841,12 @@ fn reduce_all<T: Number>(input: &Buffer<T>, reduce: ElementDual, id: T) -> Resul
 
         let kernel = Kernel::builder()
             .name("reduce")
-            .program(&program)
+            .program(&program.for_queue(&queue)?)
             .queue(queue.clone())
             .local_work_size(WG_SIZE)
             .global_work_size(WG_SIZE * output.len())
             .arg(input.len() as u64)
+            .arg(id)
             .arg(&input)
             .arg(&output)
             .arg_local::<T>(WG_SIZE)
