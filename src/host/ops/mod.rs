@@ -323,7 +323,7 @@ impl<L, R, T: Number> Dual<L, R, T, T> {
         Self {
             left,
             right,
-            zip: T::pow,
+            zip: T::rem,
         }
     }
 
@@ -720,8 +720,8 @@ impl<A: Access<T>, T: Number> Enqueue<Host, T> for MatDiag<A, T> {
 
 impl<A: Access<T>, T: Number> ReadValue<Host, T> for MatDiag<A, T> {
     fn read_value(&self, offset: usize) -> Result<T, Error> {
-        let batch = offset / self.batch_size;
-        let i = offset % self.batch_size;
+        let batch = offset / self.dim;
+        let i = offset % self.dim;
         let source_offset = (batch * self.dim * self.dim) + (i * self.dim) + i;
         self.access.read_value(source_offset)
     }
@@ -1110,7 +1110,7 @@ impl RandomNormal {
 
     fn box_muller(u: [f32; 2]) -> [f32; 2] {
         let [u1, u2] = u;
-        let r = (u1.ln() * -2.).sqrt();
+        let r = ((1.0 - u1).ln() * -2.).sqrt();
         let theta = 2. * PI * u2;
         [r * theta.cos(), r * theta.sin()]
     }
@@ -1266,7 +1266,7 @@ where
             access,
             stride,
             reduce: Real::max,
-            id: T::MIN,
+            id: crate::numeric::minimum::<T>(),
         }
     }
 
@@ -1275,7 +1275,7 @@ where
             access,
             stride,
             reduce: Real::min,
-            id: T::MAX,
+            id: crate::numeric::maximum::<T>(),
         }
     }
 }

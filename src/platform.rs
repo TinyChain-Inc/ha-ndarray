@@ -9,7 +9,10 @@ use crate::{host, Axes, Error, Float, Number, Range, Real, Shape};
 
 /// A ha-ndarray platform
 pub trait PlatformInstance: PartialEq + Eq + Clone + Copy + Send + Sync + fmt::Debug {
-    /// Select a specific sub-platform based on data size.
+    /// Automatically select a sub-platform for the workload size within the
+    /// platform type, enabled backends, and user-configured device constraints.
+    /// Use the selection consistently for construction and returned array metadata.
+    /// Selection does not authorize fallback after capability or execution failure.
     fn select(size_hint: usize) -> Self;
 }
 
@@ -674,7 +677,7 @@ where
         // TODO: support FFT on OpenCL
         let host = match self {
             #[cfg(feature = "opencl")]
-            Self::CL(_cl) => host::Host::select(access.size()),
+            Self::CL(_) => return Err(Error::Unsupported(format!("OpenCL Fourier transform for {} is unavailable; select the host backend explicitly", std::any::type_name::<num_complex::Complex<T>>()))),
             Self::Host(host) => host,
         };
 
@@ -685,11 +688,11 @@ where
         // TODO: support IFFT on OpenCL
         let host = match self {
             #[cfg(feature = "opencl")]
-            Self::CL(_cl) => host::Host::select(access.size()),
+            Self::CL(_) => return Err(Error::Unsupported(format!("OpenCL Fourier transform for {} is unavailable; select the host backend explicitly", std::any::type_name::<num_complex::Complex<T>>()))),
             Self::Host(host) => host,
         };
 
-        host.fft(access, dim).map(AccessOp::wrap)
+        host.ifft(access, dim).map(AccessOp::wrap)
     }
 }
 

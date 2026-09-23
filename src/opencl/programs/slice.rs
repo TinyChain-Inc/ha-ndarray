@@ -1,7 +1,7 @@
 use std::fmt;
 
+use super::Program;
 use memoize::memoize;
-use ocl::Program;
 
 use crate::ops::SliceSpec;
 use crate::{AxisRange, Error};
@@ -147,7 +147,7 @@ pub fn read_slice(c_type: &'static str, spec: SliceSpec) -> Result<Program, Erro
         max_indices = bounds.max_indices(),
     );
 
-    build(&src)
+    build(&src, &[c_type], "slice")
 }
 
 // TODO: use the SharedCache option
@@ -235,7 +235,7 @@ pub fn write_to_slice(c_type: &'static str, spec: SliceSpec) -> Result<Program, 
         max_indices = bounds.max_indices(),
     );
 
-    build(&src)
+    build(&src, &[c_type], "slice")
 }
 
 // TODO: use the SharedCache option
@@ -323,5 +323,5 @@ pub fn write_value_to_slice(c_type: &'static str, spec: SliceSpec) -> Result<Pro
         max_indices = bounds.max_indices(),
     );
 
-    build(&src)
+    build(&src, &[c_type], "slice")
 }

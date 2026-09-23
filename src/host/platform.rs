@@ -147,20 +147,24 @@ where
     where
         T: Real,
     {
-        access
-            .read()
-            .and_then(|buf| buf.to_slice())
-            .map(|slice| slice.into_par_iter().copied().reduce(|| T::MIN, T::max))
+        access.read().and_then(|buf| buf.to_slice()).map(|slice| {
+            slice
+                .into_par_iter()
+                .copied()
+                .reduce(|| crate::numeric::minimum::<T>(), T::max)
+        })
     }
 
     fn min(self, access: A) -> Result<T, Error>
     where
         T: Real,
     {
-        access
-            .read()
-            .and_then(|buf| buf.to_slice())
-            .map(|slice| slice.into_par_iter().copied().reduce(|| T::MAX, T::min))
+        access.read().and_then(|buf| buf.to_slice()).map(|slice| {
+            slice
+                .into_par_iter()
+                .copied()
+                .reduce(|| crate::numeric::maximum::<T>(), T::min)
+        })
     }
 
     fn product(self, access: A) -> Result<T, Error> {

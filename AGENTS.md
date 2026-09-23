@@ -27,15 +27,26 @@
   device capacity before allocating buffers or enqueueing commands, keep
   transfers bounded, and propagate saturation to the caller; do not hide it with
   unbounded host queues or an implicit CPU/GPU fallback.
-- Device class selection is fixed before admission. If the selected class is
-  absent, fail unless bootstrap explicitly configured a fallback; never search
-  other classes opportunistically, and never reroute because a device is busy.
+- Select the platform automatically based on workload size within user-configured
+  constraints. Respect the permitted platform type, enabled backends, and configured
+  OpenCL device class. An array's incoming platform is not a permanent execution pin.
+- At a scheduling boundary, use one selected platform for operation construction,
+  prerequisite transforms, and the returned array. Axis reductions select using the
+  input element count, which represents the work to consume, not the output size.
+- Choose the OpenCL device class before admission within the configured constraints.
+  If it is absent, fail unless bootstrap explicitly configured a fallback; never
+  broaden the allowed classes opportunistically or reroute because a device is busy.
+  Workload-based selection is normal scheduling, not recovery from a capability,
+  compilation, execution, or capacity failure.
 - Run `cargo fmt` and `cargo clippy` before pushing.
 
 ## Testing Guidelines
 - Framework: Rust `#[test]` with `cargo test`; integration tests live in `tests/*.rs`.
 - Name tests descriptively (e.g., `#[test] fn transpose_concat_validates_dims()`), assert both values and shapes.
-- For GPU-specific logic, guard with feature flags and provide host fallbacks when possible.
+- Guard GPU-specific tests with feature flags. Use explicit backend adapters for
+  kernel conformance and separate tests for automatic workload-based selection;
+  do not change production scheduling to pin conformance tests to a backend.
+  A required but unavailable device must fail its test job, not fall back to host.
 - Keep tests deterministic and fast; seed randomness when used.
 
 ## Commit & Pull Request Guidelines

@@ -1,5 +1,5 @@
+use super::Program;
 use memoize::memoize;
-use ocl::Program;
 
 use crate::Error;
 
@@ -37,7 +37,7 @@ pub fn fold_axis(op: ElementDual) -> Result<Program, Error> {
 
             {o_type} reduced = init;
 
-            for (uint stride = i_offset; stride < (a + 1) * reduce_dim; stride += target_dim) {{
+            for (ulong stride = i_offset; stride < (a + 1) * reduce_dim; stride += target_dim) {{
                 reduced = {name}(reduced, input[stride]);
             }}
 
@@ -46,7 +46,7 @@ pub fn fold_axis(op: ElementDual) -> Result<Program, Error> {
         "#,
     );
 
-    build(&src)
+    build(&src, &[i_type, o_type], name)
 }
 
 pub fn reduce_axis(op: ElementDual) -> Result<Program, Error> {
@@ -59,7 +59,7 @@ pub fn reduce_axis(op: ElementDual) -> Result<Program, Error> {
         r#"
         {op}
 
-        __kernel void reduce(
+        __kernel void reduce_axis(
                 {i_type} init,
                 __global const {i_type}* input,
                 __global {o_type}* output,
@@ -79,7 +79,7 @@ pub fn reduce_axis(op: ElementDual) -> Result<Program, Error> {
                 barrier(CLK_LOCAL_MEM_FENCE);
 
                 uint next = b + stride;
-                if (next < reduce_dim) {{
+                if (b < stride) {{
                     partials[b] = {name}(partials[b], partials[next]);
                 }}
             }}
@@ -91,7 +91,7 @@ pub fn reduce_axis(op: ElementDual) -> Result<Program, Error> {
         "#,
     );
 
-    build(&src)
+    build(&src, &[i_type, o_type], name)
 }
 
 #[memoize]
@@ -107,6 +107,7 @@ pub fn reduce(op: ElementDual) -> Result<Program, Error> {
 
         __kernel void reduce(
                 const ulong size,
+                const {i_type} init,
                 __global const {i_type}* input,
                 __global {o_type}* output,
                 __local {o_type}* partials)
@@ -117,7 +118,7 @@ pub fn reduce(op: ElementDual) -> Result<Program, Error> {
             const uint b = offset % group_size;
 
             // copy from global to local memory
-            partials[b] = input[offset];
+            partials[b] = offset < size ? input[offset] : init;
 
             // reduce over local memory in parallel
             for (uint stride = group_size >> 1; stride > 0; stride = stride >> 1) {{
@@ -125,7 +126,7 @@ pub fn reduce(op: ElementDual) -> Result<Program, Error> {
 
                 if (offset + stride < size) {{
                     uint next = b + stride;
-                    if (next < group_size) {{
+                    if (b < stride) {{
                         partials[b] = {name}(partials[b], partials[b + stride]);
                     }}
                 }}
@@ -138,5 +139,5 @@ pub fn reduce(op: ElementDual) -> Result<Program, Error> {
         "#,
     );
 
-    build(&src)
+    build(&src, &[i_type, o_type], name)
 }

@@ -1,13 +1,12 @@
+use super::Program;
 use memoize::memoize;
-use ocl::Program;
 
 use crate::Error;
 
-use super::build;
+use super::{build, Builder, ElementDual, ElementUnary};
 
 const LIB: &str = r#"
-const float pi = 3.14159;
-const float resolution = 1.0 / ((float) UINT_MAX);
+const float pi = 3.14159265358979323846f;
 
 // PCG hash by Melissa E. O'Neill: https://www.pcg-random.org/
 uint pcg_hash(uint seed) {
@@ -36,7 +35,7 @@ float random(const ulong seed, const ulong offset) {
 
     rng_state = pcg_hash(rng_state);
 
-    return rng_state * resolution;
+    return (rng_state >> 8) * 0x1.0p-24f;
 }
 "#;
 
@@ -59,13 +58,13 @@ pub fn random_normal() -> Result<Program, Error> {
 
             // Box-Muller algorithm
             if (local_offset % 2 == 0) {{
-                float u1 = normal[local_offset];
+                float u1 = 1.0f - normal[local_offset];
                 float u2 = normal[local_offset + 1];
                 float r = sqrt(-2 * log(u1));
                 float theta = 2 * pi * u2;
                 buffer[global_offset] = r * cos(theta);
             }} else {{
-                float u1 = normal[local_offset - 1];
+                float u1 = 1.0f - normal[local_offset - 1];
                 float u2 = normal[local_offset];
                 float r = sqrt(-2 * log(u1));
                 float theta = 2 * pi * u2;
@@ -75,7 +74,7 @@ pub fn random_normal() -> Result<Program, Error> {
         "#
     );
 
-    build(&src)
+    build(&src, &["float"], "constructors")
 }
 
 #[memoize]
@@ -91,21 +90,34 @@ pub fn random_uniform() -> Result<Program, Error> {
         "#
     );
 
-    build(&src)
+    build(&src, &["float"], "constructors")
 }
 
 #[memoize]
-pub fn range(c_type: &'static str) -> Result<Program, Error> {
+pub fn range(add: ElementDual, mul: ElementDual, cast: ElementUnary) -> Result<Program, Error> {
+    let c_type = add.i_type;
+    let add = add.build();
+    let mul = mul.build();
+    let cast = cast.build();
     let src = format!(
         r#"
-        {LIB}
+        {add}
+        {mul}
+        {cast}
 
         __kernel void range(const {c_type} start, const {c_type} step, __global {c_type}* output) {{
             const ulong offset = get_global_id(0);
-            output[offset] = start + (offset * step);
+            output[offset] = add(start, mul(_cast(offset), step));
         }}
         "#,
     );
 
-    build(&src)
+    // Range offsets are u64 and use number-general's f64 intermediate.
+    let intermediate = if matches!(c_type, "float" | "float2") {
+        "double"
+    } else {
+        c_type
+    };
+
+    build(&src, &[c_type, intermediate], "range")
 }

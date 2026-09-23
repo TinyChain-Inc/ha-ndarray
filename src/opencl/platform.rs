@@ -179,7 +179,7 @@ impl OpenCL {
         let device_type = CL_PLATFORM.select_device_type(size_hint);
 
         let mut queue = Option::<Queue>::None;
-        let mut deps = SmallVec::<[&Queue; 3]>::with_capacity(3);
+        let mut deps = SmallVec::<[Queue; 3]>::with_capacity(3);
 
         #[inline]
         fn clone_if_match(
@@ -198,9 +198,12 @@ impl OpenCL {
 
         for option in options.iter().filter_map(|q| q.as_ref()) {
             if let Some(q) = clone_if_match(option, device_type)? {
-                queue = Some(q);
+                // Matching device classes do not order independent queues.
+                if let Some(previous) = queue.replace(q) {
+                    deps.push(previous);
+                }
             } else {
-                deps.push(*option);
+                deps.push((*option).clone());
             }
         }
 
@@ -218,12 +221,14 @@ impl OpenCL {
             let events = deps
                 .into_iter()
                 .map(|dep| {
-                    dep.enqueue_marker::<Event>(None)
-                        .map(ocl::core::Event::from)
+                    let event = dep.enqueue_marker::<Event>(None)?;
+                    // Submit the producer commands before another queue waits on them.
+                    dep.flush()?;
+
+                    Ok(ocl::core::Event::from(event))
                 })
                 .collect::<Result<SmallVec<[ocl::core::Event; 3]>, ocl::Error>>()?;
 
-            // TODO: this assignment shouldn't be necessary
             let _ = queue.enqueue_marker(Some(events.as_slice()))?;
         }
 
@@ -674,13 +679,15 @@ impl Random for OpenCL {
 impl<A: Access<T>, T: Number> ReduceAll<A, T> for OpenCL {
     fn all(self, access: A) -> Result<bool, Error> {
         let input = access.read()?.to_cl()?;
-        let result = reduce_all::<T>(&*input, T::cl_and(), T::ONE)?;
+        let result = reduce_all::<T>(&*input, T::cl_and().into_reduction(), T::ONE)?;
+
         Ok(result.into_par_iter().all(|n| n != T::ZERO))
     }
 
     fn any(self, access: A) -> Result<bool, Error> {
         let input = access.read()?.to_cl()?;
-        let result = reduce_all::<T>(&*input, T::cl_or(), T::ZERO)?;
+        let result = reduce_all::<T>(&*input, T::cl_or().into_reduction(), T::ZERO)?;
+
         Ok(result.into_par_iter().any(|n| n != T::ZERO))
     }
 
@@ -689,8 +696,11 @@ impl<A: Access<T>, T: Number> ReduceAll<A, T> for OpenCL {
         T: Real,
     {
         let input = access.read()?.to_cl()?;
-        let result = reduce_all::<T>(&*input, T::cl_max(), T::MIN)?;
-        Ok(result.into_par_iter().reduce(|| T::MIN, T::max))
+        let result = reduce_all::<T>(&*input, T::cl_max(), crate::numeric::minimum::<T>())?;
+
+        Ok(result
+            .into_par_iter()
+            .reduce(|| crate::numeric::minimum::<T>(), T::max))
     }
 
     fn min(self, access: A) -> Result<T, Error>
@@ -698,8 +708,11 @@ impl<A: Access<T>, T: Number> ReduceAll<A, T> for OpenCL {
         T: Real,
     {
         let input = access.read()?.to_cl()?;
-        let result = reduce_all::<T>(&*input, T::cl_min(), T::MAX)?;
-        Ok(result.into_par_iter().reduce(|| T::MAX, T::min))
+        let result = reduce_all::<T>(&*input, T::cl_min(), crate::numeric::maximum::<T>())?;
+
+        Ok(result
+            .into_par_iter()
+            .reduce(|| crate::numeric::maximum::<T>(), T::min))
     }
 
     fn product(self, access: A) -> Result<T, Error> {
@@ -808,11 +821,12 @@ fn reduce_all<T: Number>(input: &Buffer<T>, reduce: ElementDual, id: T) -> Resul
 
         let kernel = Kernel::builder()
             .name("reduce")
-            .program(&program)
+            .program(&program.for_queue(&queue)?)
             .queue(queue.clone())
             .local_work_size(WG_SIZE)
             .global_work_size(WG_SIZE * output.len())
             .arg(input.len() as u64)
+            .arg(id)
             .arg(input)
             .arg(&output)
             .arg_local::<T>(WG_SIZE)
@@ -836,11 +850,12 @@ fn reduce_all<T: Number>(input: &Buffer<T>, reduce: ElementDual, id: T) -> Resul
 
         let kernel = Kernel::builder()
             .name("reduce")
-            .program(&program)
+            .program(&program.for_queue(&queue)?)
             .queue(queue.clone())
             .local_work_size(WG_SIZE)
             .global_work_size(WG_SIZE * output.len())
             .arg(input.len() as u64)
+            .arg(id)
             .arg(&input)
             .arg(&output)
             .arg_local::<T>(WG_SIZE)
@@ -855,5 +870,49 @@ fn reduce_all<T: Number>(input: &Buffer<T>, reduce: ElementDual, id: T) -> Resul
 
     let mut result = vec![id; buffer.len()];
     buffer.read(&mut result).enq()?;
+
     Ok(result)
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn selected_queue_waits_for_other_same_class_producers() -> Result<(), ocl::Error> {
+        let producer = OpenCL::queue(2, &[])?;
+        let other = Queue::new(OpenCL::context(), producer.device(), None)?;
+        let gate = Event::user(OpenCL::context())?;
+        let buffer = Buffer::<u32>::builder()
+            .queue(producer.clone())
+            .len(2)
+            .fill_val(0)
+            .build()?;
+        buffer.cmd().fill(7, None).ewait(&gate).enq()?;
+        producer.flush()?;
+
+        let selected = OpenCL::queue(2, &[Some(&producer), Some(&other)])?;
+        let (send, recv) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = selected.finish();
+            send.send(result).unwrap();
+        });
+        let early = recv.recv_timeout(Duration::from_secs(1));
+        // Always release the producer and join before asserting, even on regression.
+        gate.set_complete()?;
+        worker.join().unwrap();
+
+        assert!(
+            matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+            "consumer completed before the other input queue's producer: {early:?}"
+        );
+        recv.recv().unwrap()?;
+        let mut values = vec![0; 2];
+        buffer.read(&mut values).enq()?;
+
+        assert_eq!(values, vec![7; 2]);
+        Ok(())
+    }
 }

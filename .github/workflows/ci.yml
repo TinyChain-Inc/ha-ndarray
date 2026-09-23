@@ -4,6 +4,13 @@ on:
   push:
     branches: [ main, master ]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_gpu:
+        description: Run GPU conformance on the self-hosted opencl-gpu runner
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   rust:
@@ -56,6 +63,9 @@ jobs:
             done < <(find "$dir" -name Cargo.toml -type f)
           done
 
+      - name: Install numerical test dependencies
+        run: sudo apt-get update && sudo apt-get install -y m4
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -87,5 +97,120 @@ jobs:
             cargo test
           fi
 
-# Note: OpenCL-related tests are not run in CI by default.
-# They require GPU drivers and an OpenCL ICD on the runner.
+      - name: Native lint
+        run: cargo clippy --all-targets --features "${{ matrix.features }}" -- -D warnings
+
+      - name: Release numerical conformance
+        run: cargo test --release --features complex --test numerics --target-dir target/host-release
+
+  opencl-cpu:
+    name: OpenCL CPU numerical conformance
+    runs-on: ubuntu-latest
+    env:
+      CC: /usr/bin/cc
+      CXX: /usr/bin/c++
+      M4: /usr/bin/m4
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: /usr/bin/cc
+      HA_NDARRAY_OPENCL_DEVICE: CPU
+      POCL_CACHE_DIR: /tmp/ha-ndarray-pocl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap local path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          declare -A seen
+          queue=("$PWD")
+          seen["$PWD"]=1
+
+          while ((${#queue[@]})); do
+            dir="${queue[0]}"
+            queue=("${queue[@]:1}")
+
+            while IFS= read -r cargo; do
+              while IFS= read -r dep; do
+                [[ -n "$dep" ]] || continue
+                dep_dir="$(cd "$dir/.." && pwd)/$dep"
+
+                if [[ ! -d "$dep_dir" ]]; then
+                  echo "Cloning dependency repo: $dep"
+                  git clone --depth 1 "https://github.com/TinyChain-Inc/$dep.git" "$dep_dir"
+                fi
+
+                if [[ -z "${seen[$dep_dir]+x}" ]]; then
+                  queue+=("$dep_dir")
+                  seen["$dep_dir"]=1
+                fi
+              done < <(
+                grep -hoE 'path[[:space:]]*=[[:space:]]*"\.\./[^"]+"' "$cargo" \
+                  | sed -E 's/.*"\.\.\/([^"]+)".*/\1/' \
+                  | sort -u || true
+              )
+            done < <(find "$dir" -name Cargo.toml -type f)
+          done
+
+      - name: Install CPU OpenCL and oracle build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pocl-opencl-icd ocl-icd-opencl-dev clinfo build-essential m4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: clinfo -l
+      - run: cargo test --all-targets --features opencl,complex --target-dir target/opencl-tests
+      - run: cargo test --release --features opencl,complex --test numerics --target-dir target/opencl-tests
+      - run: cargo test --doc --all-features --target-dir target/opencl-tests
+      - run: cargo clippy --all-targets --all-features --target-dir target/opencl-tests -- -D warnings
+
+  opencl-gpu:
+    name: OpenCL GPU numerical conformance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
+    runs-on: [self-hosted, linux, x64, opencl-gpu]
+    env:
+      CC: /usr/bin/cc
+      CXX: /usr/bin/c++
+      M4: /usr/bin/m4
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: /usr/bin/cc
+      HA_NDARRAY_OPENCL_DEVICE: GPU
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap local path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          declare -A seen
+          queue=("$PWD")
+          seen["$PWD"]=1
+
+          while ((${#queue[@]})); do
+            dir="${queue[0]}"
+            queue=("${queue[@]:1}")
+
+            while IFS= read -r cargo; do
+              while IFS= read -r dep; do
+                [[ -n "$dep" ]] || continue
+                dep_dir="$(cd "$dir/.." && pwd)/$dep"
+
+                if [[ ! -d "$dep_dir" ]]; then
+                  echo "Cloning dependency repo: $dep"
+                  git clone --depth 1 "https://github.com/TinyChain-Inc/$dep.git" "$dep_dir"
+                fi
+
+                if [[ -z "${seen[$dep_dir]+x}" ]]; then
+                  queue+=("$dep_dir")
+                  seen["$dep_dir"]=1
+                fi
+              done < <(
+                grep -hoE 'path[[:space:]]*=[[:space:]]*"\.\./[^"]+"' "$cargo" \
+                  | sed -E 's/.*"\.\.\/([^"]+)".*/\1/' \
+                  | sort -u || true
+              )
+            done < <(find "$dir" -name Cargo.toml -type f)
+          done
+
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Require installed OpenCL runtime and oracle tools
+        run: clinfo -l && m4 --version
+      - run: cargo test --all-targets --features opencl,complex --target-dir target/opencl-gpu-tests
+      - run: cargo test --release --features opencl,complex --test numerics --target-dir target/opencl-gpu-tests

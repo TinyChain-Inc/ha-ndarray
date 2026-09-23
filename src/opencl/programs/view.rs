@@ -1,5 +1,5 @@
+use super::Program;
 use memoize::memoize;
-use ocl::Program;
 
 use crate::ops::{FlipSpec, ViewSpec};
 use crate::Error;
@@ -20,7 +20,7 @@ pub fn flip(c_type: &'static str, spec: FlipSpec) -> Result<Program, Error> {
         const ulong strides[{ndim}] = {strides};
         const ulong dims[{ndim}] = {shape};
 
-        __kernel void view(
+        __kernel void flip(
                 __global const {c_type}* restrict input,
                 __global {c_type}* restrict output)
         {{
@@ -50,7 +50,7 @@ pub fn flip(c_type: &'static str, spec: FlipSpec) -> Result<Program, Error> {
         "#,
     );
 
-    build(&src)
+    build(&src, &[c_type], "view")
 }
 
 // TODO: support SharedCache
@@ -100,5 +100,5 @@ pub fn view(c_type: &'static str, spec: ViewSpec) -> Result<Program, Error> {
         ndim_offset = (ndim_out - ndim_in)
     );
 
-    build(&src)
+    build(&src, &[c_type], "view")
 }

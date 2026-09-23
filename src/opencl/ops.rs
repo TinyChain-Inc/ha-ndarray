@@ -4,13 +4,14 @@ use std::marker::PhantomData;
 
 use frand::Rand;
 use number_general as ng;
-use ocl::{Buffer, Kernel, Program, Queue};
+use ocl::{Buffer, Kernel, Queue};
 
 use super::platform::OpenCL;
-use super::{programs, TILE_SIZE, WG_SIZE};
-use crate::access::{Access, AccessBuf, AccessMut};
+use super::programs::Program;
+use super::{programs, CLElement, TILE_SIZE, WG_SIZE};
+use crate::access::{Access, AccessMut};
 use crate::opencl::programs::{ElementDual, ElementUnary};
-use crate::ops::{Concat, Enqueue, FlipSpec, Op, ReadValue, ReduceAll, SliceSpec, ViewSpec, Write};
+use crate::ops::{Concat, Enqueue, FlipSpec, Op, ReadValue, SliceSpec, ViewSpec, Write};
 use crate::{
     strides_for, Axes, BufferConverter, Error, Float, Number, Platform, Range, Real, Shape, Strides,
 };
@@ -51,7 +52,7 @@ impl<A: Access<IT>, IT: Number, OT: Number> Enqueue<OpenCL, OT> for Cast<A, IT, 
 
         let kernel = Kernel::builder()
             .name("cast")
-            .program(&self.program)
+            .program(&self.program.for_queue(&queue)?)
             .queue(queue)
             .global_work_size(input.len())
             .arg(&*input)
@@ -287,7 +288,7 @@ where
 
         let kernel = Kernel::builder()
             .name("dual")
-            .program(&self.program)
+            .program(&self.program.for_queue(&queue)?)
             .queue(queue)
             .global_work_size(left.len())
             .arg(&*left)
@@ -391,8 +392,8 @@ where
 
         let kernel = Kernel::builder()
             .name("gather_cond")
+            .program(&self.program.for_queue(&queue)?)
             .queue(queue)
-            .program(&self.program)
             .global_work_size(cond.len())
             .arg(&*cond)
             .arg(&*then)
@@ -470,7 +471,7 @@ impl<A: Access<T>, T: Number> Enqueue<OpenCL, T> for Flip<A, T> {
 
         let kernel = Kernel::builder()
             .name("flip")
-            .program(&self.program)
+            .program(&self.program.for_queue(&queue)?)
             .queue(queue)
             .global_work_size(self.size())
             .arg(&*source)
@@ -539,9 +540,10 @@ impl<A: Access<T>, T: Number> Enqueue<OpenCL, T> for MatDiag<A, T> {
 
         let kernel = Kernel::builder()
             .name("diagonal")
-            .program(&self.program)
+            .program(&self.program.for_queue(&queue)?)
             .queue(queue)
             .global_work_size((self.batch_size, self.dim))
+            .arg(self.dim as u64)
             .arg(&*input)
             .arg(&output)
             .build()?;
@@ -556,8 +558,8 @@ impl<A: Access<T>, T: Number> Enqueue<OpenCL, T> for MatDiag<A, T> {
 
 impl<A: Access<T>, T: Number> ReadValue<OpenCL, T> for MatDiag<A, T> {
     fn read_value(&self, offset: usize) -> Result<T, Error> {
-        let batch = offset / self.batch_size;
-        let i = offset % self.batch_size;
+        let batch = offset / self.dim;
+        let i = offset % self.dim;
         let source_offset = (batch * self.dim * self.dim) + (i * self.dim) + i;
         self.access.read_value(source_offset)
     }
@@ -580,9 +582,10 @@ where
 {
     pub fn new(left: L, right: R, dims: [usize; 4]) -> Result<Self, Error> {
         let pad_matrices = programs::linalg::pad_matrices(T::TYPE)?;
-        let matmul = programs::linalg::matmul(T::cl_mul())?;
+        let matmul = programs::linalg::matmul(T::cl_mul(), T::cl_add())?;
 
         let [batch_size, a, b, c] = dims;
+
         assert!(batch_size > 0);
 
         let dims = [a, b, c];
@@ -631,7 +634,7 @@ where
 
         let kernel = Kernel::builder()
             .name("matmul")
-            .program(&self.matmul)
+            .program(&self.matmul.for_queue(&queue)?)
             .queue(queue)
             .global_work_size((
                 self.batch_size,
@@ -684,7 +687,7 @@ where
 
         let kernel = Kernel::builder()
             .name("pad_matrices")
-            .program(&self.pad_matrices)
+            .program(&self.pad_matrices.for_queue(&queue)?)
             .queue(queue)
             .global_work_size(gws)
             .arg(ocl::core::Ulong2::from(strides_in))
@@ -762,12 +765,14 @@ pub struct Linear<T> {
 
 impl<T: Number> Linear<T> {
     pub fn new(start: T, step: T, size: usize) -> Result<Self, Error> {
-        programs::constructors::range(T::TYPE).map(|program| Self {
-            start,
-            step,
-            size,
-            program,
-        })
+        programs::constructors::range(T::cl_add(), T::cl_mul(), u64::cl_cast::<T>()).map(
+            |program| Self {
+                start,
+                step,
+                size,
+                program,
+            },
+        )
     }
 
     #[inline]
@@ -799,8 +804,8 @@ impl<T: Number> Enqueue<OpenCL, T> for Linear<T> {
 
         let kernel = Kernel::builder()
             .name("range")
+            .program(&self.program.for_queue(&queue)?)
             .queue(queue)
-            .program(&self.program)
             .global_work_size(self.size)
             .arg(self.start)
             .arg(self.step)
@@ -853,7 +858,7 @@ impl Enqueue<OpenCL, f32> for RandomNormal {
         let kernel = Kernel::builder()
             .name("random_normal")
             .queue(queue.clone())
-            .program(&self.program)
+            .program(&self.program.for_queue(&queue)?)
             .global_work_size(buffer.len())
             .local_work_size(WG_SIZE)
             .arg(u64::from(seed))
@@ -916,8 +921,8 @@ impl Enqueue<OpenCL, f32> for RandomUniform {
 
         let kernel = Kernel::builder()
             .name("random_uniform")
+            .program(&self.program.for_queue(&queue)?)
             .queue(queue)
-            .program(&self.program)
             .global_work_size(output.len())
             .arg(seed as u64)
             .arg(&output)
@@ -942,18 +947,11 @@ pub struct Reduce<A, T: Number> {
     stride: usize,
     fold: Program,
     reduce: Program,
-    reduce_all: fn(OpenCL, AccessBuf<Buffer<T>>) -> Result<T, Error>,
     id: T,
 }
 
 impl<A, T: Number> Reduce<A, T> {
-    fn new(
-        access: A,
-        stride: usize,
-        reduce: ElementDual,
-        reduce_all: fn(OpenCL, AccessBuf<Buffer<T>>) -> Result<T, Error>,
-        id: T,
-    ) -> Result<Self, Error> {
+    fn new(access: A, stride: usize, reduce: ElementDual, id: T) -> Result<Self, Error> {
         let fold = programs::reduce::fold_axis(reduce.clone())?;
         let reduce = programs::reduce::reduce_axis(reduce)?;
 
@@ -962,29 +960,16 @@ impl<A, T: Number> Reduce<A, T> {
             stride,
             fold,
             reduce,
-            reduce_all,
             id,
         })
     }
 
     pub fn product(access: A, stride: usize) -> Result<Self, Error> {
-        Self::new(
-            access,
-            stride,
-            T::cl_mul(),
-            <OpenCL as ReduceAll<AccessBuf<Buffer<T>>, T>>::product,
-            T::ONE,
-        )
+        Self::new(access, stride, T::cl_mul(), T::ONE)
     }
 
     pub fn sum(access: A, stride: usize) -> Result<Self, Error> {
-        Self::new(
-            access,
-            stride,
-            T::cl_add(),
-            <OpenCL as ReduceAll<AccessBuf<Buffer<T>>, T>>::sum,
-            T::ZERO,
-        )
+        Self::new(access, stride, T::cl_add(), T::ZERO)
     }
 
     fn fold(
@@ -1004,7 +989,7 @@ impl<A, T: Number> Reduce<A, T> {
 
         let kernel = Kernel::builder()
             .name("fold_axis")
-            .program(&self.fold)
+            .program(&self.fold.for_queue(&queue)?)
             .queue(queue)
             .global_work_size(output_size)
             .arg(reduce_dim as u64)
@@ -1038,7 +1023,7 @@ impl<A, T: Number> Reduce<A, T> {
 
         let kernel = Kernel::builder()
             .name("reduce_axis")
-            .program(&self.reduce)
+            .program(&self.reduce.for_queue(&queue)?)
             .queue(queue.clone())
             .local_work_size(wg_size)
             .global_work_size(input.len())
@@ -1060,25 +1045,13 @@ impl<A, T: Real> Reduce<A, T> {
     pub fn max(access: A, stride: usize) -> Result<Self, Error> {
         let reduce = T::cl_max();
 
-        Self::new(
-            access,
-            stride,
-            reduce,
-            <OpenCL as ReduceAll<AccessBuf<Buffer<T>>, T>>::max,
-            T::MIN,
-        )
+        Self::new(access, stride, reduce, crate::numeric::minimum::<T>())
     }
 
     pub fn min(access: A, stride: usize) -> Result<Self, Error> {
         let reduce = T::cl_min();
 
-        Self::new(
-            access,
-            stride,
-            reduce,
-            <OpenCL as ReduceAll<AccessBuf<Buffer<T>>, T>>::min,
-            T::MAX,
-        )
+        Self::new(access, stride, reduce, crate::numeric::maximum::<T>())
     }
 }
 
@@ -1129,9 +1102,15 @@ impl<A: Access<T>, T: Number> Enqueue<OpenCL, T> for Reduce<A, T> {
 
 impl<A: Access<T>, T: Number> ReadValue<OpenCL, T> for Reduce<A, T> {
     fn read_value(&self, offset: usize) -> Result<T, Error> {
-        let input = self.access.read()?.to_cl()?;
-        let slice = input.create_sub_buffer(None, offset, offset + self.stride)?;
-        (self.reduce_all)(OpenCL, AccessBuf::from(slice))
+        if offset >= self.size() {
+            return Err(Error::bounds(format!("invalid reduction offset {offset}")));
+        }
+
+        let output = self.enqueue()?;
+        let mut value = [T::ZERO];
+        output.read(&mut value[..]).offset(offset).enq()?;
+
+        Ok(value[0])
     }
 }
 
@@ -1337,7 +1316,7 @@ where
 
         let kernel = Kernel::builder()
             .name("dual_scalar")
-            .program(&self.program)
+            .program(&self.program.for_queue(&queue)?)
             .queue(queue)
             .global_work_size(input.len())
             .arg(&*input)
@@ -1412,7 +1391,7 @@ impl<A: Access<T>, T: Number> Enqueue<OpenCL, T> for Slice<A, T> {
 
         let kernel = Kernel::builder()
             .name("read_slice")
-            .program(&self.read)
+            .program(&self.read.for_queue(&queue)?)
             .queue(queue)
             .global_work_size(output.len())
             .arg(&*source)
@@ -1443,7 +1422,7 @@ where
         let size_hint = self.size();
         let source = self.access.cl_buffer()?;
 
-        let queue = OpenCL::queue(size_hint, &[source.default_queue()])?;
+        let queue = OpenCL::queue(size_hint, &[data.default_queue(), source.default_queue()])?;
 
         if self.write.is_none() {
             let program = programs::slice::write_to_slice(T::TYPE, self.spec.clone())?;
@@ -1452,16 +1431,23 @@ where
 
         let kernel = Kernel::builder()
             .name("write_slice")
-            .program(self.write.as_ref().expect("CL write op"))
-            .queue(queue)
-            .global_work_size(source.len())
-            .arg(source)
+            .program(
+                &self
+                    .write
+                    .as_ref()
+                    .expect("CL write op")
+                    .for_queue(&queue)?,
+            )
+            .queue(queue.clone())
+            .global_work_size(size_hint)
+            .arg(&*source)
             .arg(&*data)
             .build()?;
 
         // SAFETY: kernel arguments and dimensions are validated, and all referenced
         // buffers outlive this enqueue.
         unsafe { kernel.enq()? }
+        source.set_default_queue(queue);
 
         Ok(())
     }
@@ -1472,23 +1458,30 @@ where
 
         let queue = OpenCL::queue(size_hint, &[source.default_queue()])?;
 
-        if self.write.is_none() {
+        if self.write_value.is_none() {
             let program = programs::slice::write_value_to_slice(T::TYPE, self.spec.clone())?;
             self.write_value = Some(program);
         }
 
         let kernel = Kernel::builder()
             .name("write_slice_value")
-            .program(self.write_value.as_ref().expect("CL write op"))
-            .queue(queue)
-            .global_work_size(source.len())
-            .arg(source)
+            .program(
+                &self
+                    .write_value
+                    .as_ref()
+                    .expect("CL write op")
+                    .for_queue(&queue)?,
+            )
+            .queue(queue.clone())
+            .global_work_size(size_hint)
+            .arg(&*source)
             .arg(value)
             .build()?;
 
         // SAFETY: kernel arguments and dimensions are validated, and all referenced
         // buffers outlive this enqueue.
         unsafe { kernel.enq()? }
+        source.set_default_queue(queue);
 
         Ok(())
     }
@@ -1522,7 +1515,7 @@ impl<A, IT: Number, OT: Number> Unary<A, IT, OT> {
 
 impl<A, T: Float> Unary<A, T, T> {
     pub fn exp(access: A) -> Result<Self, Error> {
-        Self::new(access, T::cl_exp(), T::ln)
+        Self::new(access, T::cl_exp(), T::exp)
     }
 
     pub fn ln(access: A) -> Result<Self, Error> {
@@ -1649,7 +1642,7 @@ where
 
         let kernel = Kernel::builder()
             .name("unary")
-            .program(&self.program)
+            .program(&self.program.for_queue(&queue)?)
             .queue(queue)
             .global_work_size(input.len())
             .arg(&*input)
@@ -1735,7 +1728,7 @@ impl<A: Access<T>, T: Number> Enqueue<OpenCL, T> for View<A, T> {
 
         let kernel = Kernel::builder()
             .name("view")
-            .program(&self.program)
+            .program(&self.program.for_queue(&queue)?)
             .queue(queue)
             .global_work_size(self.size)
             .arg(&*source)

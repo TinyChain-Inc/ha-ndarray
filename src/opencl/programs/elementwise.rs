@@ -1,5 +1,5 @@
+use super::Program;
 use memoize::memoize;
-use ocl::Program;
 
 use crate::Error;
 
@@ -26,7 +26,20 @@ pub fn cast(op: ElementUnary) -> Result<Program, Error> {
         "#,
     );
 
-    build(&src)
+    // Integer-to-float casts pass through number-general's source-width float,
+    // which can differ from the destination precision in either direction.
+    let float = |t| matches!(t, "float" | "float2" | "double" | "double2");
+    let intermediate = if !float(i_type) && float(o_type) {
+        if matches!(i_type, "long" | "ulong") {
+            "double"
+        } else {
+            "float"
+        }
+    } else {
+        i_type
+    };
+
+    build(&src, &[i_type, o_type, intermediate], name)
 }
 
 #[memoize]
@@ -51,7 +64,7 @@ pub fn dual(op: ElementDual) -> Result<Program, Error> {
         "#,
     );
 
-    build(&src)
+    build(&src, &[i_type, o_type], name)
 }
 
 #[memoize]
@@ -76,7 +89,7 @@ pub fn dual_scalar(op: ElementDual) -> Result<Program, Error> {
         "#,
     );
 
-    build(&src)
+    build(&src, &[i_type, o_type], name)
 }
 
 pub fn unary(op: ElementUnary) -> Result<Program, Error> {
@@ -96,5 +109,5 @@ pub fn unary(op: ElementUnary) -> Result<Program, Error> {
         "#,
     );
 
-    build(&src)
+    build(&src, &[i_type, o_type], name)
 }

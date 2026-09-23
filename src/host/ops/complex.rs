@@ -17,7 +17,7 @@ impl<A: Access<T>, T: Number> FFT<A, T> {
     fn new(access: A, dim: usize, dir: FftDirection) -> Result<Self, Error> {
         let size = access.size();
 
-        if size % dim == 0 {
+        if dim != 0 && size != 0 && size % dim == 0 {
             Ok(Self {
                 access,
                 dim,
@@ -63,7 +63,10 @@ where
 
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft(self.dim, self.dir);
-        fft.process(buffer.as_mut());
+
+        for batch in buffer.as_mut().chunks_exact_mut(self.dim) {
+            fft.process(batch);
+        }
 
         Ok(buffer)
     }

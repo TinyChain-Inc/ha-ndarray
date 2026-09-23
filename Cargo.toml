@@ -18,7 +18,7 @@ crate-type = ["cdylib", "rlib"]
 all = ["complex", "freqfs", "opencl", "stream"]
 complex = ["num-complex", "rustfft"]
 debug_crash = [] # enable this to panic rather than retuning an error when debugging
-freqfs = ["freqfs/stream", "stream"]
+freqfs = ["dep:freqfs", "stream"]
 opencl = ["memoize", "ocl"]
 stream = ["destream", "futures"]
 wasm = ["wasm-bindgen"]
@@ -41,3 +41,6 @@ safecast = "0.2"
 smallvec = "1.13"
 transpose = "0.2"
 wasm-bindgen = { version = "0.2", optional = true }
+
+[dev-dependencies]
+rug = { version = "1", default-features = false, features = ["float", "complex", "integer", "rational"] }
