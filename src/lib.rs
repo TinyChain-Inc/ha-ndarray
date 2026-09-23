@@ -224,19 +224,24 @@ macro_rules! integer_number {
                         0
                     };
                 }
+
                 let mut result: Self = 1;
+
                 while exp != 0 {
                     if exp & 1 != 0 {
                         result = result.wrapping_mul(base);
                     }
+
                     exp >>= 1;
                     base = base.wrapping_mul(base);
                 }
+
                 result
             }
         );
     };
 }
+
 integer_number!(i8, true);
 integer_number!(i16, true);
 integer_number!(i32, true);
@@ -327,6 +332,7 @@ macro_rules! real_float {
         impl Real for $t {
             const MAX: Self = <$t>::MAX;
             const MIN: Self = <$t>::MIN;
+
             fn max(l: Self, r: Self) -> Self {
                 if l.is_nan() || r.is_nan() {
                     Self::NAN
@@ -340,6 +346,7 @@ macro_rules! real_float {
                     l.max(r)
                 }
             }
+
             fn min(l: Self, r: Self) -> Self {
                 if l.is_nan() || r.is_nan() {
                     Self::NAN
@@ -353,15 +360,18 @@ macro_rules! real_float {
                     l.min(r)
                 }
             }
+
             fn rem(self, rhs: Self) -> Self {
                 self % rhs
             }
+
             fn round(self) -> Self {
                 <$t>::round(self)
             }
         }
     };
 }
+
 real_float!(f32);
 real_float!(f64);
 real!(

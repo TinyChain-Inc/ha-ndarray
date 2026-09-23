@@ -38,6 +38,7 @@ pub fn cast(op: ElementUnary) -> Result<Program, Error> {
     } else {
         i_type
     };
+
     build(&src, &[i_type, o_type, intermediate], name)
 }
 

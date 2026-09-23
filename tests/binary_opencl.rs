@@ -21,6 +21,7 @@ fn binary_opencl_u8_wrapping_and_zero_divisors() {
             );
         };
     }
+
     check!(add, 255u8, 1u8, 0u8);
     check!(sub, 0u8, 1u8, 255u8);
     check!(mul, 255u8, 255u8, 1u8);
@@ -47,12 +48,14 @@ fn binary_opencl_float_edges() {
                     .unwrap()
                     .into_vec()[0];
                 let expected = a % b;
+
                 if expected.is_nan() {
                     assert!(result.is_nan());
                 } else {
                     assert_eq!(result.to_bits(), expected.to_bits());
                 }
             }
+
             for a in [0.0 as $t, 1.0, -1.0] {
                 let result = ArrayBuf::constant(a, shape![1])
                     .unwrap()
@@ -63,6 +66,7 @@ fn binary_opencl_float_edges() {
                     .to_slice()
                     .unwrap()
                     .into_vec()[0];
+
                 if a == 0.0 {
                     assert!(result.is_nan());
                 } else {
@@ -71,6 +75,7 @@ fn binary_opencl_float_edges() {
             }
         }};
     }
+
     check!(f32);
     check!(f64);
 }

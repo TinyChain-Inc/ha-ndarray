@@ -118,5 +118,6 @@ pub fn range(add: ElementDual, mul: ElementDual, cast: ElementUnary) -> Result<P
     } else {
         c_type
     };
+
     build(&src, &[c_type, intermediate], "range")
 }

@@ -184,6 +184,7 @@ fn compile(
     device: ocl::Device,
 ) -> Result<ocl::Program, Error> {
     use ocl::core::{DeviceInfo, DeviceInfoResult};
+
     let device_name = device
         .name()
         .unwrap_or_else(|err| format!("{device:?} ({err})"));
@@ -193,6 +194,7 @@ fn compile(
         } else {
             DeviceInfo::SingleFpConfig
         };
+
         match device.info(info) {
             Ok(
                 DeviceInfoResult::SingleFpConfig(flags) | DeviceInfoResult::DoubleFpConfig(flags),
@@ -204,9 +206,11 @@ fn compile(
     let source = format!("#pragma OPENCL FP_CONTRACT OFF\n{source}");
     let mut builder = ocl::Program::builder();
     builder.source(source).devices(device);
+
     if fp32 {
         builder.cmplr_opt("-cl-fp32-correctly-rounded-divide-sqrt");
     }
+
     builder.build(OpenCL::context()).map_err(Error::from)
 }
 
@@ -219,12 +223,16 @@ fn validate_capabilities(
     mut query: impl FnMut(bool) -> Result<ocl::core::DeviceFpConfig, String>,
 ) -> Result<bool, Error> {
     use ocl::core::DeviceFpConfig as F;
+
     let mut fp32 = false;
+
     for &dtype in types {
         let base = dtype.trim_end_matches('2');
+
         if base != "float" && base != "double" {
             continue;
         }
+
         fp32 |= base == "float";
         let flags = query(base == "double").map_err(|err| {
             Error::Unsupported(format!(
@@ -232,16 +240,20 @@ fn validate_capabilities(
             ))
         })?;
         let mut required = F::DENORM | F::INF_NAN | F::ROUND_TO_NEAREST;
+
         if base == "float" {
             required |= F::CORRECTLY_ROUNDED_DIVIDE_SQRT;
         }
+
         let missing = required & !flags;
+
         if !missing.is_empty() {
             return Err(Error::Unsupported(format!(
                 "OpenCL {operation} for {dtype} on {device}: missing {missing:?} ({base} support); device reports {flags:?}"
             )));
         }
     }
+
     Ok(fp32)
 }
 
@@ -249,18 +261,24 @@ fn validate_capabilities(
 mod capability_tests {
     use super::*;
     use ocl::core::DeviceFpConfig as F;
+
     fn all() -> F {
         F::DENORM | F::INF_NAN | F::ROUND_TO_NEAREST | F::CORRECTLY_ROUNDED_DIVIDE_SQRT
     }
+
     fn unsupported(types: &[&str], query: impl FnMut(bool) -> Result<F, String>, missing: &str) {
         let err = validate_capabilities("fixture_op", types, "fixture_device", query).unwrap_err();
+
         assert!(matches!(err, Error::Unsupported(_)));
         let message = err.to_string();
+
         for part in ["fixture_op", "fixture_device", missing] {
             assert!(message.contains(part), "{message} lacks {part}");
         }
+
         assert!(types.iter().any(|dtype| message.contains(dtype)));
     }
+
     #[test]
     fn required_flags_and_queries_fail_closed() {
         for (flag, name) in [
@@ -274,6 +292,7 @@ mod capability_tests {
         ] {
             unsupported(&["float"], |_| Ok(all() & !flag), name);
         }
+
         unsupported(&["double"], |_| Ok(F::empty()), "double support");
         unsupported(
             &["float"],
@@ -281,9 +300,11 @@ mod capability_tests {
             "query unavailable",
         );
         unsupported(&["double2"], |_| Err("query unavailable".into()), "double2");
+
         assert!(
             validate_capabilities("op", &["float2", "double2"], "device", |_| Ok(all())).unwrap()
         );
+
         assert!(
             !validate_capabilities("op", &["int", "ulong"], "device", |_| panic!(
                 "integer-only kernel queried floats"
@@ -291,6 +312,7 @@ mod capability_tests {
             .unwrap()
         );
     }
+
     #[test]
     fn generated_casts_retain_all_precision_requirements() {
         for (input, output, intermediate) in [
@@ -308,10 +330,12 @@ mod capability_tests {
                 op: "return n;".into(),
             })
             .unwrap();
+
             assert_eq!(program.types, vec![input, output, intermediate]);
             unsupported(&program.types, |_| Ok(F::empty()), "missing");
         }
     }
+
     #[test]
     fn input_output_and_intermediate_requirements() {
         for types in [
@@ -331,6 +355,7 @@ mod capability_tests {
                 "float",
             );
         }
+
         for dtype in ["float2", "double2"] {
             unsupported(&[dtype], |_| Ok(F::empty()), dtype);
         }

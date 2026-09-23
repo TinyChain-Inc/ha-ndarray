@@ -63,6 +63,7 @@ where
 
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft(self.dim, self.dir);
+
         for batch in buffer.as_mut().chunks_exact_mut(self.dim) {
             fft.process(batch);
         }

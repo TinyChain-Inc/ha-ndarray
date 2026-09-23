@@ -585,6 +585,7 @@ where
         let matmul = programs::linalg::matmul(T::cl_mul(), T::cl_add())?;
 
         let [batch_size, a, b, c] = dims;
+
         assert!(batch_size > 0);
 
         let dims = [a, b, c];
@@ -1104,9 +1105,11 @@ impl<A: Access<T>, T: Number> ReadValue<OpenCL, T> for Reduce<A, T> {
         if offset >= self.size() {
             return Err(Error::bounds(format!("invalid reduction offset {offset}")));
         }
+
         let output = self.enqueue()?;
         let mut value = [T::ZERO];
         output.read(&mut value[..]).offset(offset).enq()?;
+
         Ok(value[0])
     }
 }

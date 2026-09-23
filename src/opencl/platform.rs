@@ -224,6 +224,7 @@ impl OpenCL {
                     let event = dep.enqueue_marker::<Event>(None)?;
                     // Submit the producer commands before another queue waits on them.
                     dep.flush()?;
+
                     Ok(ocl::core::Event::from(event))
                 })
                 .collect::<Result<SmallVec<[ocl::core::Event; 3]>, ocl::Error>>()?;
@@ -679,12 +680,14 @@ impl<A: Access<T>, T: Number> ReduceAll<A, T> for OpenCL {
     fn all(self, access: A) -> Result<bool, Error> {
         let input = access.read()?.to_cl()?;
         let result = reduce_all::<T>(&*input, T::cl_and().into_reduction(), T::ONE)?;
+
         Ok(result.into_par_iter().all(|n| n != T::ZERO))
     }
 
     fn any(self, access: A) -> Result<bool, Error> {
         let input = access.read()?.to_cl()?;
         let result = reduce_all::<T>(&*input, T::cl_or().into_reduction(), T::ZERO)?;
+
         Ok(result.into_par_iter().any(|n| n != T::ZERO))
     }
 
@@ -694,6 +697,7 @@ impl<A: Access<T>, T: Number> ReduceAll<A, T> for OpenCL {
     {
         let input = access.read()?.to_cl()?;
         let result = reduce_all::<T>(&*input, T::cl_max(), crate::numeric::minimum::<T>())?;
+
         Ok(result
             .into_par_iter()
             .reduce(|| crate::numeric::minimum::<T>(), T::max))
@@ -705,6 +709,7 @@ impl<A: Access<T>, T: Number> ReduceAll<A, T> for OpenCL {
     {
         let input = access.read()?.to_cl()?;
         let result = reduce_all::<T>(&*input, T::cl_min(), crate::numeric::maximum::<T>())?;
+
         Ok(result
             .into_par_iter()
             .reduce(|| crate::numeric::maximum::<T>(), T::min))
@@ -865,6 +870,7 @@ fn reduce_all<T: Number>(input: &Buffer<T>, reduce: ElementDual, id: T) -> Resul
 
     let mut result = vec![id; buffer.len()];
     buffer.read(&mut result).enq()?;
+
     Ok(result)
 }
 
@@ -897,6 +903,7 @@ mod queue_tests {
         // Always release the producer and join before asserting, even on regression.
         gate.set_complete()?;
         worker.join().unwrap();
+
         assert!(
             matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
             "consumer completed before the other input queue's producer: {early:?}"
@@ -904,6 +911,7 @@ mod queue_tests {
         recv.recv().unwrap()?;
         let mut values = vec![0; 2];
         buffer.read(&mut values).enq()?;
+
         assert_eq!(values, vec![7; 2]);
         Ok(())
     }

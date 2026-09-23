@@ -2106,6 +2106,7 @@ mod scheduling_tests {
                 crate::host::Host::Stack(crate::host::Stack)
             });
             let result = source.sum(axes![0], false).unwrap();
+
             assert_eq!(result.platform, Platform::select(size));
             assert!(matches!(result.buffer().unwrap(), BufferConverter::Host(_)));
             assert_eq!(
@@ -2127,13 +2128,17 @@ mod scheduling_tests {
             } else {
                 Platform::Host(crate::host::Host::Heap(crate::host::Heap))
             };
+
             let result = source.sum(axes![0], false).unwrap();
+
             assert_eq!(result.platform, Platform::select(size));
             let buffer = result.buffer().unwrap();
+
             assert_eq!(
                 matches!(buffer, BufferConverter::CL(_)),
                 size >= crate::opencl::GPU_MIN_SIZE
             );
+
             assert_eq!(buffer.to_slice().unwrap().as_ref(), vec![2u32; size / 2]);
         }
     }

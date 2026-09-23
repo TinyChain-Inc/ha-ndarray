@@ -22,6 +22,7 @@ fn u8_binary_wrapping_and_zero_divisors() {
             );
         };
     }
+
     check!(add, vec![255u8, 127], vec![1, 255], vec![0, 126]);
     check!(sub, vec![0u8, 127], vec![1, 255], vec![255, 128]);
     check!(mul, vec![255u8, 128], vec![255, 2], vec![1, 0]);
@@ -49,8 +50,10 @@ fn floating_remainder_is_not_power() {
                 .to_slice()
                 .unwrap()
                 .into_vec();
+
             for ((actual, a), b) in values.into_iter().zip(a).zip(b) {
                 let expected = a % b;
+
                 if expected.is_nan() {
                     assert!(actual.is_nan());
                 } else {
@@ -59,6 +62,7 @@ fn floating_remainder_is_not_power() {
             }
         }};
     }
+
     check!(f32);
     check!(f64);
 }
