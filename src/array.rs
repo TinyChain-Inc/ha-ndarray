@@ -5,17 +5,47 @@
 use std::fmt;
 use std::marker::PhantomData;
 
-use crate::access::*;
+use crate::access::{Access, AccessBuf, AccessMut, AccessOp, Accessor};
 use crate::buffer::BufferInstance;
 use crate::ops::*;
 use crate::platform::PlatformInstance;
 #[cfg(feature = "complex")]
 use crate::Complex;
 use crate::{
-    axes, range_shape, shape, strides_for, ArrayAccess, Axes, AxisRange, BufferConverter, Constant,
-    Convert, Error, Float, Number, Platform, Range, Real, Shape,
+    axes, checked_size, shape, strides_for, ArrayAccess, Axes, AxisRange, BufferConverter,
+    Constant, Convert, Error, Float, Number, Platform, Range, Real, Shape,
 };
 
+/// An array constructed through checked operations on built-in platforms.
+/// Backend dispatch and raw operation construction are internal.
+/// Share read-only access with `as_ref` or `ArrayAccess`; use `copy` for independent
+/// writable storage. Mutation uses an ordinary mutable borrow of the array.
+///
+/// ```compile_fail
+/// use ha_ndarray::{shape, ArrayBuf};
+/// let array = ArrayBuf::new(vec![1i32, 2], shape![2]).unwrap();
+/// let alias = array.clone();
+/// ```
+///
+/// ```compile_fail
+/// use ha_ndarray::{shape, ArrayBuf};
+/// let mut array = ArrayBuf::new(vec![1i32, 2], shape![2]).unwrap();
+/// let access = array.as_mut().into_access();
+/// ```
+///
+/// ```compile_fail
+/// use ha_ndarray::{shape, ArrayBuf};
+/// let mut array = ArrayBuf::new(vec![1i32, 2], shape![2]).unwrap();
+/// let access = (&mut array).into_access();
+/// ```
+///
+/// ```compile_fail
+/// use ha_ndarray::ops::Transform;
+/// ```
+///
+/// ```compile_fail
+/// use ha_ndarray::host::ops::View;
+/// ```
 pub struct Array<T, A, P> {
     shape: Shape,
     access: A,
@@ -23,7 +53,18 @@ pub struct Array<T, A, P> {
     dtype: PhantomData<T>,
 }
 
-impl<T, A: Clone, P: Clone> Clone for Array<T, A, P> {
+impl<T, A: ?Sized, P: Clone> Clone for Array<T, &A, P> {
+    fn clone(&self) -> Self {
+        Self {
+            shape: self.shape.clone(),
+            access: self.access,
+            platform: self.platform.clone(),
+            dtype: self.dtype,
+        }
+    }
+}
+
+impl<T: Number, P: Clone> Clone for Array<T, Accessor<'_, T>, P> {
     fn clone(&self) -> Self {
         Self {
             shape: self.shape.clone(),
@@ -61,16 +102,25 @@ impl<T, A, P> Array<T, A, P> {
         A: Access<T>,
         P: Transform<A, T> + ReduceAxes<Accessor<'a, T>, T>,
         Op: Fn(P, Accessor<'a, T>, usize) -> Result<AccessOp<P::Op, P>, Error>,
-        Accessor<'a, T>: From<A> + From<AccessOp<P::Transpose, P>>,
+        Accessor<'a, T>: From<A> + From<AccessOp<P::View, P>>,
     {
         axes.sort();
         axes.dedup();
 
-        let platform = P::select(self.size());
         let shape = reduce_axes(&self.shape, &axes, keepdims)?;
-        let stride = axes.iter().copied().map(|x| self.shape[x]).product();
+        let stride = axes
+            .iter()
+            .try_fold(1usize, |stride, &axis| stride.checked_mul(self.shape[axis]))
+            .filter(|&stride| stride != 0)
+            .ok_or_else(|| {
+                Error::bounds("reduction axes require a nonzero representable cardinality".into())
+            })?;
+        let mut permutation = Axes::with_capacity(self.ndim());
+        permutation.extend((0..self.ndim()).filter(|axis| !axes.contains(axis)));
+        permutation.extend(axes);
+        let platform = P::select(self.size());
 
-        let access = permute_for_reduce(platform, self.access, self.shape, axes)?;
+        let access = permute_for_reduce(platform, self.access, self.shape, permutation)?;
         let access = (op)(platform, access, stride)?;
 
         Ok(Array {
@@ -133,21 +183,12 @@ where
     B: BufferInstance<T>,
     P: PlatformInstance,
 {
-    fn new_inner(platform: P, buffer: B, shape: Shape) -> Result<Self, Error> {
-        if !shape.is_empty() && shape.iter().product::<usize>() == buffer.len() {
-            let access = buffer.into();
-
-            Ok(Self {
-                shape,
-                access,
-                platform,
-                dtype: PhantomData,
-            })
-        } else {
-            Err(Error::bounds(format!(
-                "cannot construct an array with shape {shape:?} from a buffer of size {}",
-                buffer.len(),
-            )))
+    fn new_inner(platform: P, buffer: B, shape: Shape) -> Self {
+        Self {
+            shape,
+            access: buffer.into(),
+            platform,
+            dtype: PhantomData,
         }
     }
 
@@ -157,14 +198,19 @@ where
         P: Convert<T, Buffer = B>,
     {
         let buffer = buffer.into();
-        let platform = P::select(buffer.len());
+        let size = check_buffer_shape(&shape, buffer.len())?;
+
+        let platform = P::select(size);
         let buffer = platform.convert(buffer)?;
-        Self::new_inner(platform, buffer, shape)
+        Ok(Self::new_inner(platform, buffer, shape))
     }
 
+    /// Wrap a buffer whose length matches the checked shape cardinality.
     pub fn new(buffer: B, shape: Shape) -> Result<Self, Error> {
-        let platform = P::select(buffer.len());
-        Self::new_inner(platform, buffer, shape)
+        let size = check_buffer_shape(&shape, buffer.len())?;
+
+        let platform = P::select(size);
+        Ok(Self::new_inner(platform, buffer, shape))
     }
 }
 
@@ -173,24 +219,18 @@ where
     T: Number,
     P: Constant<T>,
 {
+    /// Allocate a buffer filled with `value`; shape `[]` contains one element.
     pub fn constant(value: T, shape: Shape) -> Result<Self, Error> {
-        if !shape.is_empty() {
-            let size = shape.iter().product();
-            let platform = P::select(size);
-            let buffer = platform.constant(value, size)?;
-            let access = buffer.into();
+        let size = checked_size(&shape)?;
+        let platform = P::select(size);
+        let buffer = platform.constant(value, size)?;
 
-            Ok(Self {
-                shape,
-                access,
-                platform,
-                dtype: PhantomData,
-            })
-        } else {
-            Err(Error::bounds(
-                "cannot construct an array with an empty shape".to_string(),
-            ))
-        }
+        Ok(Self {
+            shape,
+            access: buffer.into(),
+            platform,
+            dtype: PhantomData,
+        })
     }
 }
 
@@ -201,6 +241,7 @@ where
     A: Access<T>,
     P: Convert<T>,
 {
+    /// Evaluate into independent writable storage on this array's platform.
     pub fn copy(&self) -> Result<Array<T, AccessBuf<P::Buffer>, P>, Error> {
         let buffer = self.buffer().and_then(|buf| self.platform.convert(buf))?;
 
@@ -219,9 +260,9 @@ where
     T: Number,
     A: Access<T>,
     P: Transform<A, T>,
-    P: ConstructConcat<AccessOp<<P as Transform<A, T>>::Transpose, P>, T>,
+    P: ConstructConcat<AccessOp<<P as Transform<A, T>>::View, P>, T>,
     P: Transform<
-        AccessOp<<P as ConstructConcat<AccessOp<<P as Transform<A, T>>::Transpose, P>, T>>::Op, P>,
+        AccessOp<<P as ConstructConcat<AccessOp<<P as Transform<A, T>>::View, P>, T>>::Op, P>,
         T,
     >,
 {
@@ -308,7 +349,12 @@ where
                         next.shape()
                     )));
                 } else {
-                    shape[0] += next.shape()[0];
+                    let first = shape
+                        .first_mut()
+                        .ok_or_else(|| Error::bounds("cannot concatenate scalar arrays".into()))?;
+                    *first = first.checked_add(next.shape()[0]).ok_or_else(|| {
+                        Error::bounds("concatenation cardinality overflow".into())
+                    })?;
                 }
             }
 
@@ -324,7 +370,7 @@ where
         arrays: Vec<Array<T, A, P>>,
         shape: Shape,
     ) -> Result<Array<T, AccessOp<P::Op, P>, P>, Error> {
-        let platform = P::select(shape.iter().product());
+        let platform = P::select(checked_size(&shape)?);
 
         let data = arrays
             .into_iter()
@@ -345,7 +391,7 @@ where
     P: ConstructRange<T>,
 {
     pub fn range(start: T, stop: T, shape: Shape) -> Result<Self, Error> {
-        let size = shape.iter().product();
+        let size = checked_size(&shape)?;
         let platform = P::select(size);
 
         platform.range(start, stop, size).map(|access| Self {
@@ -357,39 +403,19 @@ where
     }
 }
 
-impl<P: PlatformInstance> Array<f32, AccessOp<P::Normal, P>, P>
-where
-    P: Random,
-{
-    /// Sample finite standard-normal f32 values. Sequences are backend-dependent.
+impl<P: Random> Array<f32, AccessBuf<P::Buffer>, P> {
+    /// Sample finite standard-normal f32 values once. Sequences are backend-dependent.
     pub fn random_normal(size: usize) -> Result<Self, Error> {
         let platform = P::select(size);
-        let shape = shape![size];
-
-        platform.random_normal(size).map(|access| Self {
-            shape,
-            access,
-            platform,
-            dtype: PhantomData,
-        })
+        let buffer = platform.random_normal(size)?;
+        Ok(Self::new_inner(platform, buffer, shape![size]))
     }
-}
 
-impl<P: PlatformInstance> Array<f32, AccessOp<P::Uniform, P>, P>
-where
-    P: Random,
-{
-    /// Sample uniform f32 values in [0, 1). Sequences are backend-dependent.
+    /// Sample uniform f32 values in [0, 1) once. Sequences are backend-dependent.
     pub fn random_uniform(size: usize) -> Result<Self, Error> {
         let platform = P::select(size);
-        let shape = shape![size];
-
-        platform.random_uniform(size).map(|access| Self {
-            shape,
-            access,
-            platform,
-            dtype: PhantomData,
-        })
+        let buffer = platform.random_uniform(size)?;
+        Ok(Self::new_inner(platform, buffer, shape![size]))
     }
 }
 
@@ -400,27 +426,22 @@ where
     A: Access<T>,
     P: PlatformInstance,
 {
-    pub fn as_mut<'a, B>(&'a mut self) -> Array<T, B, P>
-    where
-        A: AccessBorrowMut<'a, T, B>,
-        B: AccessMut<T> + 'a,
-    {
+    /// Borrow this array's accessor, retaining owned shape metadata.
+    /// The returned view cannot outlive the array it borrows.
+    ///
+    /// ```compile_fail
+    /// use ha_ndarray::{shape, ArrayBuf, NDArrayRead};
+    ///
+    /// let view = {
+    ///     let array = ArrayBuf::new(vec![1i32, 2], shape![2]).unwrap();
+    ///     array.as_ref()
+    /// };
+    /// assert_eq!(view.read_value(&[0]).unwrap(), 1);
+    /// ```
+    pub fn as_ref(&self) -> Array<T, &A, P> {
         Array {
             shape: Shape::from_slice(&self.shape),
-            access: AccessBorrowMut::borrow_mut(&mut self.access),
-            platform: self.platform,
-            dtype: PhantomData,
-        }
-    }
-
-    pub fn as_ref<'a, B>(&'a self) -> Array<T, B, P>
-    where
-        A: AccessBorrow<'a, T, B>,
-        B: Access<T> + 'a,
-    {
-        Array {
-            shape: Shape::from_slice(&self.shape),
-            access: AccessBorrow::borrow(&self.access),
+            access: &self.access,
             platform: self.platform,
             dtype: PhantomData,
         }
@@ -529,7 +550,8 @@ pub trait NDArrayRead: NDArray + fmt::Debug + Sized {
     /// Read the value of this [`NDArray`] into a [`BufferConverter`].
     fn buffer(&self) -> Result<BufferConverter<'_, Self::DType>, Error>;
 
-    /// Buffer this [`NDArray`] into a new, owned array, allocating only if needed.
+    /// Consume this [`NDArray`] into an owned array on its current platform.
+    /// Owned buffers move when possible; borrowed or shared buffers are copied.
     fn into_read(
         self,
     ) -> Result<
@@ -561,14 +583,21 @@ where
     where
         P: Convert<T>,
     {
-        let buffer = self.buffer().and_then(|buf| self.platform.convert(buf))?;
-        debug_assert_eq!(buffer.len(), self.size());
+        let Self {
+            shape,
+            access,
+            platform,
+            dtype,
+        } = self;
+
+        let buffer = platform.convert(access.into_buffer()?.into())?;
+        debug_assert_eq!(buffer.len(), shape.iter().product::<usize>());
 
         Ok(Array {
-            shape: self.shape,
+            shape,
             access: buffer.into(),
-            platform: self.platform,
-            dtype: self.dtype,
+            platform,
+            dtype,
         })
     }
 
@@ -587,7 +616,16 @@ where
     }
 }
 
-/// Access methods for a mutable [`NDArray`]
+/// Access methods for a mutable [`NDArray`].
+/// Reads keep their source borrowed until the returned data is released.
+///
+/// ```compile_fail
+/// use ha_ndarray::{shape, ArrayBuf, NDArrayRead, NDArrayWrite};
+/// let mut array = ArrayBuf::new(vec![1i32, 2], shape![2]).unwrap();
+/// let data = array.buffer().unwrap();
+/// array.write_value(3).unwrap();
+/// assert_eq!(data.len(), 2);
+/// ```
 pub trait NDArrayWrite: NDArray + fmt::Debug + Sized {
     /// Overwrite this [`NDArray`] with the value of the `other` array.
     fn write<O: NDArrayRead<DType = Self::DType>>(&mut self, other: &O) -> Result<(), Error>;
@@ -702,7 +740,7 @@ where
     T: Number + 'a,
     A: Access<T> + 'a,
     P: Transform<A, T> + ReduceAxes<Accessor<'a, T>, T> + 'a,
-    Accessor<'a, T>: From<A> + From<AccessOp<P::Transpose, P>> + 'a,
+    Accessor<'a, T>: From<A> + From<AccessOp<P::View, P>> + 'a,
 {
     type Output = AccessOp<P::Op, P>;
 
@@ -802,21 +840,16 @@ where
     A: Access<T>,
     P: Transform<A, T>,
 {
-    type Broadcast = AccessOp<P::Broadcast, P>;
+    type Broadcast = AccessOp<P::View, P>;
     type Flip = AccessOp<P::Flip, P>;
     type Slice = AccessOp<P::Slice, P>;
-    type Transpose = AccessOp<P::Transpose, P>;
+    type Transpose = AccessOp<P::View, P>;
 
-    fn broadcast(self, shape: Shape) -> Result<Array<T, AccessOp<P::Broadcast, P>, P>, Error> {
-        if !can_broadcast(self.shape(), &shape) {
-            return Err(Error::bounds(format!(
-                "cannot broadcast {self:?} into {shape:?}"
-            )));
-        }
-
-        let platform = P::select(shape.iter().product());
-        let broadcast = Shape::from_slice(&shape);
-        let access = platform.broadcast(self.access, self.shape, broadcast)?;
+    fn broadcast(self, shape: Shape) -> Result<Array<T, AccessOp<P::View, P>, P>, Error> {
+        let spec = ViewSpec::broadcast(self.shape, shape)?;
+        let shape = spec.shape().clone();
+        let platform = P::select(spec.size());
+        let access = platform.view(self.access, spec)?;
 
         Ok(Array {
             shape,
@@ -827,11 +860,13 @@ where
     }
 
     fn flip(self, axis: usize) -> Result<Array<T, AccessOp<P::Flip, P>, P>, Error> {
+        let spec = FlipSpec::new(self.shape, axis)?;
+        let shape = spec.shape().clone();
         let platform = self.platform;
-        let access = platform.flip(self.access, self.shape.clone(), axis)?;
+        let access = platform.flip(self.access, spec)?;
 
         Ok(Array {
-            shape: self.shape,
+            shape,
             access,
             platform,
             dtype: self.dtype,
@@ -839,7 +874,7 @@ where
     }
 
     fn reshape(mut self, shape: Shape) -> Result<Self, Error> {
-        if shape.iter().product::<usize>() == self.size() {
+        if checked_size(&shape)? == self.size() {
             self.shape = shape;
             Ok(self)
         } else {
@@ -850,25 +885,11 @@ where
         }
     }
 
-    fn slice(self, mut range: Range) -> Result<Array<T, AccessOp<P::Slice, P>, P>, Error> {
-        for (dim, range) in self.shape.iter().zip(&range) {
-            match range {
-                AxisRange::At(i) if i < dim => Ok(()),
-                AxisRange::In(start, stop, _step) if start < dim && stop <= dim => Ok(()),
-                AxisRange::Of(indices) if indices.iter().all(|i| i < dim) => Ok(()),
-                range => Err(Error::bounds(format!(
-                    "invalid range {range:?} for dimension {dim}"
-                ))),
-            }?;
-        }
-
-        for dim in self.shape.iter().skip(range.len()).copied() {
-            range.push(AxisRange::In(0, dim, 1));
-        }
-
-        let shape = range_shape(self.shape(), &range);
-        let access = self.platform.slice(self.access, &self.shape, range)?;
-        let platform = P::select(shape.iter().product());
+    fn slice(self, range: Range) -> Result<Array<T, AccessOp<P::Slice, P>, P>, Error> {
+        let spec = crate::ops::SliceSpec::new(&self.shape, range)?;
+        let shape = spec.shape().clone();
+        let platform = P::select(spec.size());
+        let access = platform.slice(self.access, spec)?;
 
         Ok(Array {
             shape,
@@ -880,13 +901,16 @@ where
 
     fn squeeze(mut self, mut axes: Axes) -> Result<Self, Error> {
         axes.sort();
+        if axes.windows(2).any(|pair| pair[0] == pair[1])
+            || axes.iter().any(|&axis| self.shape.get(axis) != Some(&1))
+        {
+            return Err(Error::bounds(
+                "squeeze requires distinct singleton axes".into(),
+            ));
+        }
 
         for x in axes.into_iter().rev() {
-            if x < self.shape.len() {
-                self.shape.remove(x);
-            } else {
-                return Err(Error::bounds(format!("axis out of bounds: {x}")));
-            }
+            self.shape.remove(x);
         }
 
         Ok(self)
@@ -907,26 +931,14 @@ where
     fn transpose<PA: Into<Option<Axes>>>(
         self,
         permutation: PA,
-    ) -> Result<Array<T, AccessOp<P::Transpose, P>, P>, Error> {
-        let permutation = if let Some(axes) = permutation.into() {
-            if axes.len() == self.ndim()
-                && axes.iter().copied().all(|x| x < self.ndim())
-                && !(1..axes.len()).any(|i| axes[i..].contains(&axes[i - 1]))
-            {
-                Ok(axes)
-            } else {
-                Err(Error::bounds(format!(
-                    "invalid permutation for shape {:?}: {:?}",
-                    self.shape, axes
-                )))
-            }
-        } else {
-            Ok((0..self.ndim()).rev().collect())
-        }?;
-
-        let shape = permutation.iter().copied().map(|x| self.shape[x]).collect();
+    ) -> Result<Array<T, AccessOp<P::View, P>, P>, Error> {
+        let permutation = permutation
+            .into()
+            .unwrap_or_else(|| (0..self.ndim()).rev().collect());
+        let spec = ViewSpec::transpose(self.shape, permutation)?;
+        let shape = spec.shape().clone();
         let platform = self.platform;
-        let access = platform.transpose(self.access, self.shape, permutation)?;
+        let access = platform.view(self.access, spec)?;
 
         Ok(Array {
             shape,
@@ -1876,7 +1888,11 @@ where
         shape.push(dims[1]);
         shape.push(dims[3]);
 
-        let platform = P::select(dims.iter().product());
+        checked_size(&[dims[1], dims[2]])?;
+        checked_size(&[dims[2], dims[3]])?;
+        checked_size(&[dims[1], dims[3]])?;
+        checked_size(&shape)?;
+        let platform = P::select(checked_size(&dims)?);
 
         let access = platform.matmul(self.access, other.access, dims)?;
 
@@ -1909,10 +1925,16 @@ where
     P: LinAlgUnary<A, T> + Transform<A, T>,
 {
     type Diag = AccessOp<<P as LinAlgUnary<A, T>>::Op, P>;
-    type Transpose = AccessOp<<P as Transform<A, T>>::Transpose, P>;
+    type Transpose = AccessOp<<P as Transform<A, T>>::View, P>;
 
     fn mt(self) -> Result<Array<Self::DType, Self::Transpose, Self::Platform>, Error> {
         let ndim = self.ndim();
+        if ndim < 2 {
+            return Err(Error::bounds(
+                "matrix transpose requires at least two axes".into(),
+            ));
+        }
+
         let mut permutation = Axes::with_capacity(ndim);
         permutation.extend(0..self.ndim() - 2);
         permutation.push(ndim - 1);
@@ -1922,11 +1944,13 @@ where
 
     fn diag(self) -> Result<Array<T, AccessOp<P::Op, P>, P>, Error> {
         if self.ndim() >= 2 && self.shape.last() == self.shape.iter().nth_back(1) {
-            let batch_size = self.shape.iter().rev().skip(2).product();
+            let batch_size = checked_size(&self.shape[..self.ndim() - 2])?;
             let dim = self.shape.last().copied().expect("dim");
 
             let shape = self.shape.iter().rev().skip(1).rev().copied().collect();
-            let platform = P::select(batch_size * dim * dim);
+            checked_size(&[dim, dim])?;
+            checked_size(&[batch_size, dim])?;
+            let platform = P::select(checked_size(&[batch_size, dim, dim])?);
             let access = platform.diag(self.access, batch_size, dim)?;
 
             Ok(Array {
@@ -1971,6 +1995,18 @@ where
 }
 
 #[inline]
+fn check_buffer_shape(shape: &[usize], len: usize) -> Result<usize, Error> {
+    let size = checked_size(shape)?;
+    if size == len {
+        Ok(size)
+    } else {
+        Err(Error::bounds(
+            "buffer cardinality does not match array shape".into(),
+        ))
+    }
+}
+
+#[inline]
 fn can_broadcast(left: &[usize], right: &[usize]) -> bool {
     if left.len() < right.len() {
         return can_broadcast(right, left);
@@ -2000,11 +2036,11 @@ fn matmul_dims(left: &[usize], right: &[usize]) -> Option<[usize; 4]> {
         return None;
     }
 
-    let mut batch_size = 1;
+    let mut batch_size = 1usize;
     loop {
         match (left.next(), right.next()) {
             (Some(l), Some(r)) if l == r => {
-                batch_size *= l;
+                batch_size = batch_size.checked_mul(l)?;
             }
             (None, None) => break,
             _ => return None,
@@ -2019,24 +2055,19 @@ fn permute_for_reduce<'a, T, A, P>(
     platform: P,
     access: A,
     shape: Shape,
-    axes: Axes,
+    permutation: Axes,
 ) -> Result<Accessor<'a, T>, Error>
 where
     T: Number,
     A: Access<T>,
     P: Transform<A, T>,
-    Accessor<'a, T>: From<A> + From<AccessOp<P::Transpose, P>>,
+    Accessor<'a, T>: From<A> + From<AccessOp<P::View, P>>,
 {
-    let mut permutation = Axes::with_capacity(shape.len());
-    permutation.extend((0..shape.len()).filter(|x| !axes.contains(x)));
-    permutation.extend(axes);
-
     if permutation.iter().copied().enumerate().all(|(i, x)| i == x) {
         Ok(Accessor::from(access))
     } else {
-        platform
-            .transpose(access, shape, permutation)
-            .map(Accessor::from)
+        let spec = ViewSpec::transpose(shape, permutation)?;
+        platform.view(access, spec).map(Accessor::from)
     }
 }
 
@@ -2056,11 +2087,7 @@ fn reduce_axes(shape: &[usize], axes: &[usize], keepdims: bool) -> Result<Shape,
         }
     }
 
-    if shape.is_empty() {
-        Ok(shape![1])
-    } else {
-        Ok(shape)
-    }
+    Ok(shape)
 }
 
 #[inline]

@@ -1,4 +1,4 @@
-# this Dockerfile requires nvidia-docker in order to test CUDA & OpenCL features with the --gpus=all option
+# GPU execution requires the NVIDIA Container Toolkit and an OpenCL runtime.
 #
 # nvidia-docker: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
 #
@@ -7,11 +7,11 @@
 #   $ # ...
 #   $ Successfully built <IMAGE ID>
 #   $ docker run --gpus=all -it <IMAGE ID>
-#   $ cargo test --features=cuda
+#   $ HA_NDARRAY_OPENCL_DEVICE=GPU cargo test --features=opencl
 #
 # alternate usage:
 #   $ docker run --gpus=all -it $(docker build -q .)
-#   $ cargo test --features=opencl
+#   $ HA_NDARRAY_OPENCL_DEVICE=GPU cargo test --features=opencl
 
 FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
 LABEL Name=cuda-opencl-rust Version=0.0.1

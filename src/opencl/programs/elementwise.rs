@@ -1,9 +1,7 @@
-use super::Program;
 use memoize::memoize;
 
+use super::{build, Builder, ElementDual, ElementUnary, Program};
 use crate::Error;
-
-use super::{build, Builder, ElementDual, ElementUnary};
 
 #[memoize]
 pub fn cast(op: ElementUnary) -> Result<Program, Error> {

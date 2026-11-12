@@ -2,7 +2,8 @@
 
 ## Project Structure & Module Organization
 - Source: `src/` with host and GPU backends: `src/host/`, `src/opencl/`, and core types in `src/array.rs`, `src/buffer.rs`, `src/ops/`.
-- Library entry: `src/lib.rs` (crate type `rlib`/`cdylib`).
+- Library entry: `src/lib.rs` (ordinary Rust library). Request `cdylib` explicitly
+  for standalone dynamic-library/WASM builds, as documented in `README.md`.
 - OpenCL kernels: `src/opencl/programs/`.
 - Tests: integration tests in `tests/*.rs` (e.g., `tests/construct.rs`).
 - Packaging/build metadata: `Cargo.toml`, `Cargo.lock`; container setup in `Dockerfile`.
@@ -10,11 +11,11 @@
 ## Build, Test, and Development Commands
 - Build (CPU/host only): `cargo build`.
 - Enable features (e.g., OpenCL): `cargo build --features opencl` or all: `cargo build --features all`.
-- Run tests: `cargo test` (host) or explicitly select the installed OpenCL
-  device class, for example
-  `HA_NDARRAY_OPENCL_DEVICE=GPU cargo test --features opencl`.
+- Select affected targets and feature configurations using
+  [CONTRIBUTING.md](CONTRIBUTING.md#validation). Device tests explicitly select
+  the installed OpenCL class; Host results do not establish device conformance.
 - Docs: `cargo doc --no-deps` (add `--open` locally to view).
-- Format and lint: `cargo fmt --all` and `cargo clippy --all-targets --all-features -D warnings`.
+- Format and lint: `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings`.
 
 ## Coding Style & Naming Conventions
 - Rust 2021 edition; 4-space indentation; keep lines reasonably short.
@@ -34,8 +35,8 @@
   prerequisite transforms, and the returned array. Axis reductions select using the
   input element count, which represents the work to consume, not the output size.
 - Choose the OpenCL device class before admission within the configured constraints.
-  If it is absent, fail unless bootstrap explicitly configured a fallback; never
-  broaden the allowed classes opportunistically or reroute because a device is busy.
+  If it is absent, return an error; never broaden the allowed classes
+  opportunistically or reroute because a device is busy.
   Workload-based selection is normal scheduling, not recovery from a capability,
   compilation, execution, or capacity failure.
 - Run `cargo fmt` and `cargo clippy` before pushing.
@@ -47,13 +48,17 @@
   kernel conformance and separate tests for automatic workload-based selection;
   do not change production scheduling to pin conformance tests to a backend.
   A required but unavailable device must fail its test job, not fall back to host.
-- Keep tests deterministic and fast; seed randomness when used.
+- Use fixed numerical inputs where possible. Random-constructor fixtures check
+  distributions and sample stability without assuming reproducible seeds.
 
 ## Commit & Pull Request Guidelines
 - Commits: short, imperative subject (e.g., "implement Array::concat"), reference issues when relevant (e.g., `(#28)`).
 - PRs: include a clear description, motivation, feature flags used (`opencl`, `complex`, etc.), and test coverage notes; add benchmarks only if necessary.
-- Required: passing `cargo test`, `cargo fmt`, and `cargo clippy` with no new warnings.
+- Required: affected-target tests, `cargo fmt`, and appropriate strict Clippy checks,
+  following [the validation policy](CONTRIBUTING.md#validation). Full validation
+  remains required before releases.
 
 ## Security & Configuration Tips
 - OpenCL support is optional (`--features opencl`) and requires drivers/ICD on the host; verify with `clinfo`.
-- The provided `Dockerfile` can build with GPU support; run with `docker run --gpus=all` when testing OpenCL.
+- GPU container execution requires the NVIDIA Container Toolkit and an installed
+  OpenCL runtime. Container/deployment validation is separate from native tests.

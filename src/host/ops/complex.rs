@@ -4,16 +4,16 @@ use rustfft::{FftDirection, FftNum, FftPlanner};
 
 use crate::host::{Buffer, Host};
 use crate::ops::{Enqueue, Op, ReadValue};
-use crate::{Access, Complex, Error, Number};
+use crate::{Access, BufferConverter, Complex, Error, Number};
 
-pub struct FFT<A, T> {
+pub struct Fft<A, T> {
     access: A,
     dim: usize,
     dir: FftDirection,
     dtype: PhantomData<T>,
 }
 
-impl<A: Access<T>, T: Number> FFT<A, T> {
+impl<A: Access<T>, T: Number> Fft<A, T> {
     fn new(access: A, dim: usize, dir: FftDirection) -> Result<Self, Error> {
         let size = access.size();
 
@@ -44,13 +44,13 @@ impl<A: Access<T>, T: Number> FFT<A, T> {
     }
 }
 
-impl<A: Access<T>, T: Number> Op for FFT<A, T> {
+impl<A: Access<T>, T: Number> Op for Fft<A, T> {
     fn size(&self) -> usize {
         self.access.size()
     }
 }
 
-impl<A, T> Enqueue<Host, num_complex::Complex<T>> for FFT<A, num_complex::Complex<T>>
+impl<A, T> Enqueue<Host, num_complex::Complex<T>> for Fft<A, num_complex::Complex<T>>
 where
     A: Access<num_complex::Complex<T>>,
     T: FftNum,
@@ -59,23 +59,38 @@ where
     type Buffer = Buffer<num_complex::Complex<T>>;
 
     fn enqueue(&self) -> Result<Self::Buffer, Error> {
-        let mut buffer = self.access.read()?.to_slice()?.into_buffer();
+        let buffer = self.access.read()?.to_slice()?.into_buffer();
+        Ok(transform(buffer, self.dim, self.dir))
+    }
 
-        let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft(self.dim, self.dir);
+    fn into_enqueue(self) -> Result<Self::Buffer, Error> {
+        let buffer = BufferConverter::from(self.access.into_buffer()?)
+            .to_slice()?
+            .into_buffer();
 
-        for batch in buffer.as_mut().chunks_exact_mut(self.dim) {
-            fft.process(batch);
-        }
-
-        Ok(buffer)
+        Ok(transform(buffer, self.dim, self.dir))
     }
 }
 
-impl<A: Access<T>, T: Number> ReadValue<Host, T> for FFT<A, T> {
+impl<A: Access<T>, T: Number> ReadValue<Host, T> for Fft<A, T> {
     fn read_value(&self, _offset: usize) -> Result<T, Error> {
         Err(Error::unsupported(
             "read an individual value from a Fourier transform".into(),
         ))
     }
+}
+
+fn transform<T: FftNum>(
+    mut buffer: Buffer<num_complex::Complex<T>>,
+    dim: usize,
+    dir: FftDirection,
+) -> Buffer<num_complex::Complex<T>> {
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft(dim, dir);
+
+    for batch in buffer.as_mut().chunks_exact_mut(dim) {
+        fft.process(batch);
+    }
+
+    buffer
 }

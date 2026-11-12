@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use number_general as ng;
 use ocl::core::{DeviceInfo, DeviceInfoResult};
 use ocl::{Buffer, Context, Device, DeviceType, Event, Kernel, Platform, Queue};
 use rayon::prelude::*;
@@ -19,7 +18,7 @@ use crate::ops::{
     Transform,
 };
 use crate::platform::{Convert, PlatformInstance};
-use crate::{Axes, Constant, Error, Float, Number, Range, Real, Shape};
+use crate::{Constant, Error, Float, Number, Real};
 
 #[cfg(debug_assertions)]
 pub const GPU_MIN_SIZE: usize = 128;
@@ -160,12 +159,15 @@ pub struct OpenCL;
 
 impl OpenCL {
     /// Borrow the OpenCL [`Context`] of this platform.
-    pub fn context<'a>() -> &'a Context {
-        &CL_PLATFORM.cl_context
+    pub fn context() -> Result<&'static Context, Error> {
+        CL_PLATFORM
+            .as_ref()
+            .map(|platform| &platform.cl_context)
+            .map_err(Clone::clone)
     }
 
     /// Copy the given `data` into a new [`Buffer`].
-    pub fn copy_into_buffer<T: Number>(data: &[T]) -> Result<Buffer<T>, ocl::Error> {
+    pub fn copy_into_buffer<T: Number>(data: &[T]) -> Result<Buffer<T>, Error> {
         let queue = Self::queue(data.len(), &[])?;
 
         ocl::builders::BufferBuilder::new()
@@ -173,10 +175,12 @@ impl OpenCL {
             .queue(queue)
             .copy_host_slice(data)
             .build()
+            .map_err(Error::from)
     }
 
-    pub(crate) fn queue(size_hint: usize, options: &[Option<&Queue>]) -> Result<Queue, ocl::Error> {
-        let device_type = CL_PLATFORM.select_device_type(size_hint);
+    pub(crate) fn queue(size_hint: usize, options: &[Option<&Queue>]) -> Result<Queue, Error> {
+        let platform = CL_PLATFORM.as_ref().map_err(Clone::clone)?;
+        let device_type = platform.select_device_type(size_hint);
 
         let mut queue = Option::<Queue>::None;
         let mut deps = SmallVec::<[Queue; 3]>::with_capacity(3);
@@ -210,11 +214,11 @@ impl OpenCL {
         let queue = if let Some(queue) = queue {
             queue
         } else {
-            let device = CL_PLATFORM
+            let device = platform
                 .select_device(device_type)
                 .ok_or_else(|| ocl::Error::from(format!("no {device_type:?} device configured")))?;
 
-            Queue::new(&CL_PLATFORM.cl_context, device, None)?
+            Queue::new(&platform.cl_context, device, None)?
         };
 
         if !deps.is_empty() {
@@ -261,10 +265,7 @@ impl<T: Number> Convert<T> for OpenCL {
     type Buffer = Buffer<T>;
 
     fn convert(&self, buffer: BufferConverter<T>) -> Result<Self::Buffer, Error> {
-        buffer
-            .to_cl()
-            .map_err(Error::from)
-            .and_then(|buf| buf.into_buffer())
+        buffer.to_cl().and_then(|buf| buf.into_buffer())
     }
 }
 
@@ -284,13 +285,13 @@ impl<T: Number + PartialOrd> ConstructRange<T> for OpenCL {
     type Range = Linear<T>;
 
     fn range(self, start: T, stop: T, size: usize) -> Result<AccessOp<Self::Range, Self>, Error> {
-        if start <= stop {
-            let size_t = T::cast_from(ng::Number::from(size as u64));
-            let step = T::div(T::sub(stop, start), size_t);
-            Linear::new(start, step, size).map(AccessOp::from)
-        } else {
-            Err(Error::bounds(format!("invalid range: [{start}, {stop})")))
+        let step = crate::ops::range_step(start, stop, size)?;
+        if size == 0 {
+            return Err(Error::unsupported(
+                "empty OpenCL ranges are unsupported".into(),
+            ));
         }
+        Linear::new(start, step, size).map(AccessOp::from)
     }
 }
 
@@ -664,15 +665,12 @@ impl<A: Access<T>, T: Number> LinAlgUnary<A, T> for OpenCL {
 }
 
 impl Random for OpenCL {
-    type Normal = RandomNormal;
-    type Uniform = RandomUniform;
-
-    fn random_normal(self, size: usize) -> Result<AccessOp<Self::Normal, Self>, Error> {
-        RandomNormal::new(size).map(AccessOp::from)
+    fn random_normal(self, size: usize) -> Result<Self::Buffer, Error> {
+        super::ops::random_normal(size)
     }
 
-    fn random_uniform(self, size: usize) -> Result<AccessOp<Self::Uniform, Self>, Error> {
-        RandomUniform::new(size).map(AccessOp::from)
+    fn random_uniform(self, size: usize) -> Result<Self::Buffer, Error> {
+        super::ops::random_uniform(size)
     }
 }
 
@@ -755,45 +753,32 @@ impl<A: Access<T>, T: Number> ReduceAxes<A, T> for OpenCL {
 }
 
 impl<A: Access<T>, T: Number> Transform<A, T> for OpenCL {
-    type Broadcast = View<A, T>;
+    type View = View<A, T>;
     type Flip = Flip<A, T>;
     type Slice = Slice<A, T>;
-    type Transpose = View<A, T>;
 
-    fn broadcast(
+    fn view(
         self,
         access: A,
-        shape: Shape,
-        broadcast: Shape,
-    ) -> Result<AccessOp<Self::Broadcast, Self>, Error> {
-        View::broadcast(access, shape, broadcast).map(AccessOp::from)
+        spec: crate::ops::ViewSpec,
+    ) -> Result<AccessOp<Self::View, Self>, Error> {
+        View::new(access, spec).map(AccessOp::from)
     }
 
     fn flip(
         self,
         access: A,
-        shape: Shape,
-        axis: usize,
+        spec: crate::ops::FlipSpec,
     ) -> Result<AccessOp<Self::Flip, Self>, Error> {
-        Flip::new(access, shape, axis).map(AccessOp::from)
+        Flip::new(access, spec).map(AccessOp::from)
     }
 
     fn slice(
         self,
         access: A,
-        shape: &[usize],
-        range: Range,
+        spec: crate::ops::SliceSpec,
     ) -> Result<AccessOp<Self::Slice, Self>, Error> {
-        Slice::new(access, shape, range).map(AccessOp::from)
-    }
-
-    fn transpose(
-        self,
-        access: A,
-        shape: Shape,
-        permutation: Axes,
-    ) -> Result<AccessOp<Self::Transpose, Self>, Error> {
-        View::transpose(access, shape, permutation).map(AccessOp::from)
+        Slice::new(access, spec).map(AccessOp::from)
     }
 }
 
@@ -876,15 +861,16 @@ fn reduce_all<T: Number>(input: &Buffer<T>, reduce: ElementDual, id: T) -> Resul
 
 #[cfg(test)]
 mod queue_tests {
-    use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
 
+    use super::*;
+
     #[test]
-    fn selected_queue_waits_for_other_same_class_producers() -> Result<(), ocl::Error> {
+    fn selected_queue_waits_for_other_same_class_producers() -> Result<(), Error> {
         let producer = OpenCL::queue(2, &[])?;
-        let other = Queue::new(OpenCL::context(), producer.device(), None)?;
-        let gate = Event::user(OpenCL::context())?;
+        let other = Queue::new(OpenCL::context()?, producer.device(), None)?;
+        let gate = Event::user(OpenCL::context()?)?;
         let buffer = Buffer::<u32>::builder()
             .queue(producer.clone())
             .len(2)
@@ -901,7 +887,7 @@ mod queue_tests {
         });
         let early = recv.recv_timeout(Duration::from_secs(1));
         // Always release the producer and join before asserting, even on regression.
-        gate.set_complete()?;
+        gate.set_complete().map_err(ocl::Error::from)?;
         worker.join().unwrap();
 
         assert!(

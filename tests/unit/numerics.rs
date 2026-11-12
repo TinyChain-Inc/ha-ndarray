@@ -1,9 +1,8 @@
 //! The same numerical cases execute on explicit host and OpenCL buffers.
-#[macro_use]
-mod conformance;
 
 mod host {
-    use ha_ndarray::{host::ArrayBuf, shape, Number};
+    use ha_ndarray::host::ArrayBuf;
+    use ha_ndarray::{shape, Number};
 
     fn input<T: Number>(values: Vec<T>) -> ArrayBuf<T> {
         let len = values.len();
@@ -15,8 +14,8 @@ mod host {
         stride: usize,
         product: bool,
     ) -> Vec<T> {
-        use ha_ndarray::PlatformInstance;
-        use ha_ndarray::{ops::ReduceAxes, Access};
+        use ha_ndarray::ops::ReduceAxes;
+        use ha_ndarray::{Access, PlatformInstance};
 
         let platform = ha_ndarray::host::Host::select(access.size());
         let result = if product {
@@ -29,7 +28,8 @@ mod host {
     }
 
     fn reduce_max(values: Vec<f64>, stride: usize) -> Vec<f64> {
-        use ha_ndarray::{ops::ReduceAxes, Access};
+        use ha_ndarray::ops::ReduceAxes;
+        use ha_ndarray::Access;
 
         ReduceAxes::max(
             ha_ndarray::host::Host::Heap(ha_ndarray::host::Heap),
@@ -134,29 +134,16 @@ mod host {
     }
 
     fn random(normal: bool, size: usize) -> Vec<f32> {
-        use ha_ndarray::{ops::Random, Access};
+        use ha_ndarray::ops::Random;
+        use ha_ndarray::BufferInstance;
 
         let platform = ha_ndarray::host::Host::Heap(ha_ndarray::host::Heap);
-
-        if normal {
-            platform
-                .random_normal(size)
-                .unwrap()
-                .read()
-                .unwrap()
-                .to_slice()
-                .unwrap()
-                .into_vec()
+        let buffer = if normal {
+            platform.random_normal(size).unwrap()
         } else {
-            platform
-                .random_uniform(size)
-                .unwrap()
-                .read()
-                .unwrap()
-                .to_slice()
-                .unwrap()
-                .into_vec()
-        }
+            platform.random_uniform(size).unwrap()
+        };
+        BufferInstance::read(&buffer).to_slice().unwrap().into_vec()
     }
 
     conformance_suite!();
@@ -164,10 +151,8 @@ mod host {
 
 #[cfg(feature = "opencl")]
 mod opencl {
-    use ha_ndarray::{
-        opencl::{ArrayBuf, OpenCL},
-        shape, Number,
-    };
+    use ha_ndarray::opencl::{ArrayBuf, OpenCL};
+    use ha_ndarray::{shape, Number};
 
     fn input<T: Number>(values: Vec<T>) -> ArrayBuf<T> {
         let len = values.len();
@@ -177,11 +162,18 @@ mod opencl {
     #[cfg(feature = "complex")]
     #[test]
     fn fft_is_explicitly_unsupported() {
-        use ha_ndarray::{complex::Complex32, ArrayAccess, Error, NDArrayFourier};
+        use ha_ndarray::complex::Complex32;
+        use ha_ndarray::{ArrayAccess, Error, NDArrayFourier};
 
         let a = ArrayAccess::from(input(vec![Complex32::new(1., 2.); 3]));
 
         assert!(matches!(a.clone().fft(), Err(Error::Unsupported(_))));
+        assert!(matches!(a.ifft(), Err(Error::Unsupported(_))));
+
+        let size = ha_ndarray::opencl::GPU_MIN_SIZE;
+        let a =
+            ha_ndarray::ArrayBuf::new(vec![Complex32::new(1., 2.); size], shape![size]).unwrap();
+        assert!(matches!(a.as_ref().fft(), Err(Error::Unsupported(_))));
         assert!(matches!(a.ifft(), Err(Error::Unsupported(_))));
     }
 
@@ -190,7 +182,8 @@ mod opencl {
         stride: usize,
         product: bool,
     ) -> Vec<T> {
-        use ha_ndarray::{ops::ReduceAxes, Access};
+        use ha_ndarray::ops::ReduceAxes;
+        use ha_ndarray::Access;
 
         let platform = OpenCL;
         let result = if product {
@@ -203,7 +196,8 @@ mod opencl {
     }
 
     fn reduce_max(values: Vec<f64>, stride: usize) -> Vec<f64> {
-        use ha_ndarray::{ops::ReduceAxes, Access};
+        use ha_ndarray::ops::ReduceAxes;
+        use ha_ndarray::Access;
 
         {
             let op = ReduceAxes::max(OpenCL, input(values).into_access(), stride).unwrap();
@@ -218,27 +212,16 @@ mod opencl {
     }
 
     fn random(normal: bool, size: usize) -> Vec<f32> {
-        use ha_ndarray::{ops::Random, Access};
+        use ha_ndarray::ops::Random;
+        use ha_ndarray::BufferInstance;
 
-        if normal {
-            OpenCL
-                .random_normal(size)
-                .unwrap()
-                .read()
-                .unwrap()
-                .to_slice()
-                .unwrap()
-                .into_vec()
+        let platform = OpenCL;
+        let buffer = if normal {
+            platform.random_normal(size).unwrap()
         } else {
-            OpenCL
-                .random_uniform(size)
-                .unwrap()
-                .read()
-                .unwrap()
-                .to_slice()
-                .unwrap()
-                .into_vec()
-        }
+            platform.random_uniform(size).unwrap()
+        };
+        BufferInstance::read(&buffer).to_slice().unwrap().into_vec()
     }
 
     conformance_suite!();

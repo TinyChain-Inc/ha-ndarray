@@ -1,5 +1,8 @@
 //! Test-only certified references. Bounds enclose every intermediate operation.
-use rug::{float::Round, ops::*, Float, Integer, Rational};
+
+use rug::float::Round;
+use rug::ops::*;
+use rug::{Float, Integer, Rational};
 
 #[derive(Clone, Debug)]
 pub struct Interval {

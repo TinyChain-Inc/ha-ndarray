@@ -1,8 +1,7 @@
 use std::fmt;
 
-use crate::Error;
-
 use super::{CLElement, OpenCL, TILE_SIZE, WG_SIZE};
+use crate::Error;
 
 pub mod constructors;
 pub mod elementwise;
@@ -141,6 +140,9 @@ impl<'a, T> From<&'a [T]> for ArrayFormat<'a, T> {
 impl<'a, T: fmt::Display> fmt::Display for ArrayFormat<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("{ ")?;
+        if self.arr.is_empty() {
+            f.write_str("0")?;
+        }
 
         for item in self.arr {
             write!(f, "{item}, ")?;
@@ -211,7 +213,7 @@ fn compile(
         builder.cmplr_opt("-cl-fp32-correctly-rounded-divide-sqrt");
     }
 
-    builder.build(OpenCL::context()).map_err(Error::from)
+    builder.build(OpenCL::context()?).map_err(Error::from)
 }
 
 /// Validate requirements independently of querying a particular device. The caller
@@ -259,8 +261,9 @@ fn validate_capabilities(
 
 #[cfg(test)]
 mod capability_tests {
-    use super::*;
     use ocl::core::DeviceFpConfig as F;
+
+    use super::*;
 
     fn all() -> F {
         F::DENORM | F::INF_NAN | F::ROUND_TO_NEAREST | F::CORRECTLY_ROUNDED_DIVIDE_SQRT

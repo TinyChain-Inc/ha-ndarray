@@ -11,22 +11,18 @@ repository = "https://github.com/TinyChain-Inc/ha-ndarray.git"
 keywords = ["ndarray", "tensor", "gpu", "ml", "parallel"]
 categories = ["data-structures", "hardware-support", "mathematics"]
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [features]
 all = ["complex", "freqfs", "opencl", "stream"]
 complex = ["num-complex", "rustfft"]
-debug_crash = [] # enable this to panic rather than retuning an error when debugging
 freqfs = ["dep:freqfs", "stream"]
 opencl = ["memoize", "ocl"]
 stream = ["destream", "futures"]
-wasm = ["wasm-bindgen"]
+wasm = ["dep:getrandom"]
 
 [dependencies]
 destream = { path = "../destream", version = "0.10.1", optional = true }
 futures = { version = "0.3", optional = true }
-frand = "0.10"
+frand = { version = "0.10", default-features = false }
 freqfs = { path = "../freqfs", version = "0.13", optional = true }
 get-size = "0.1"
 lazy_static = "1.5"
@@ -40,7 +36,15 @@ rustfft = { version = "6.2", optional = true }
 safecast = "0.2"
 smallvec = "1.13"
 transpose = "0.2"
-wasm-bindgen = { version = "0.2", optional = true }
 
-[dev-dependencies]
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+getrandom = "0.4"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.4", optional = true, features = ["wasm_js"] }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "=0.3.78"
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 rug = { version = "1", default-features = false, features = ["float", "complex", "integer", "rational"] }

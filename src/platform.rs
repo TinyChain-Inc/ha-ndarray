@@ -5,7 +5,7 @@ use crate::buffer::{Buffer, BufferConverter, BufferInstance};
 #[cfg(feature = "opencl")]
 use crate::opencl;
 use crate::ops::*;
-use crate::{host, Axes, Error, Float, Number, Range, Real, Shape};
+use crate::{host, Error, Float, Number, Real};
 
 /// A ha-ndarray platform
 pub trait PlatformInstance: PartialEq + Eq + Clone + Copy + Send + Sync + fmt::Debug {
@@ -18,7 +18,7 @@ pub trait PlatformInstance: PartialEq + Eq + Clone + Copy + Send + Sync + fmt::D
 
 /// Constructor for a new buffer filled with a single value
 pub trait Constant<T: Number>: PlatformInstance {
-    /// The type of buffer use by this platform
+    /// The type of buffer used by this platform
     type Buffer: BufferInstance<T>;
 
     /// Construct a new buffer filled with a single value.
@@ -27,7 +27,7 @@ pub trait Constant<T: Number>: PlatformInstance {
 
 /// Converter to construct an owned, platform-specific buffer
 pub trait Convert<T: Number>: PlatformInstance {
-    /// The type of buffer use by this platform
+    /// The type of buffer used by this platform
     type Buffer: BufferInstance<T>;
 
     fn convert(&self, buffer: BufferConverter<T>) -> Result<Self::Buffer, Error>;
@@ -671,7 +671,7 @@ where
     T: rustfft::FftNum,
     num_complex::Complex<T>: crate::Complex,
 {
-    type Op = complex::FFT<A, num_complex::Complex<T>>;
+    type Op = complex::Fft<A, num_complex::Complex<T>>;
 
     fn fft(self, access: A, dim: usize) -> Result<AccessOp<Self::Op, Self>, Error> {
         // TODO: support FFT on OpenCL
@@ -754,22 +754,19 @@ impl<A: Access<T>, T: Number> LinAlgUnary<A, T> for Platform {
 }
 
 impl Random for Platform {
-    type Normal = RandomNormal;
-    type Uniform = RandomUniform;
-
-    fn random_normal(self, size: usize) -> Result<AccessOp<Self::Normal, Self>, Error> {
+    fn random_normal(self, size: usize) -> Result<Self::Buffer, Error> {
         match self {
             #[cfg(feature = "opencl")]
-            Self::CL(cl) => cl.random_normal(size).map(AccessOp::wrap),
-            Self::Host(host) => host.random_normal(size).map(AccessOp::wrap),
+            Self::CL(cl) => cl.random_normal(size).map(Buffer::CL),
+            Self::Host(host) => host.random_normal(size).map(Buffer::Host),
         }
     }
 
-    fn random_uniform(self, size: usize) -> Result<AccessOp<Self::Uniform, Self>, Error> {
+    fn random_uniform(self, size: usize) -> Result<Self::Buffer, Error> {
         match self {
             #[cfg(feature = "opencl")]
-            Self::CL(cl) => cl.random_uniform(size).map(AccessOp::wrap),
-            Self::Host(host) => host.random_uniform(size).map(AccessOp::wrap),
+            Self::CL(cl) => cl.random_uniform(size).map(Buffer::CL),
+            Self::Host(host) => host.random_uniform(size).map(Buffer::Host),
         }
     }
 }
@@ -877,62 +874,43 @@ impl<A: Access<T>, T: Number> ReduceAxes<A, T> for Platform {
 }
 
 impl<A: Access<T>, T: Number> Transform<A, T> for Platform {
-    type Broadcast = View<A, T>;
+    type View = View<A, T>;
     type Flip = Flip<A, T>;
     type Slice = Slice<A, T>;
-    type Transpose = View<A, T>;
 
-    fn broadcast(
+    fn view(
         self,
         access: A,
-        shape: Shape,
-        broadcast: Shape,
-    ) -> Result<AccessOp<Self::Broadcast, Self>, Error> {
+        spec: crate::ops::ViewSpec,
+    ) -> Result<AccessOp<Self::View, Self>, Error> {
         match self {
             #[cfg(feature = "opencl")]
-            Self::CL(cl) => cl.broadcast(access, shape, broadcast).map(AccessOp::wrap),
-            Self::Host(host) => host.broadcast(access, shape, broadcast).map(AccessOp::wrap),
+            Self::CL(cl) => cl.view(access, spec).map(AccessOp::wrap),
+            Self::Host(host) => host.view(access, spec).map(AccessOp::wrap),
         }
     }
 
     fn flip(
         self,
         access: A,
-        shape: Shape,
-        axis: usize,
+        spec: crate::ops::FlipSpec,
     ) -> Result<AccessOp<Self::Flip, Self>, Error> {
         match self {
             #[cfg(feature = "opencl")]
-            Self::CL(cl) => cl.flip(access, shape, axis).map(AccessOp::wrap),
-            Self::Host(host) => host.flip(access, shape, axis).map(AccessOp::wrap),
+            Self::CL(cl) => cl.flip(access, spec).map(AccessOp::wrap),
+            Self::Host(host) => host.flip(access, spec).map(AccessOp::wrap),
         }
     }
 
     fn slice(
         self,
         access: A,
-        shape: &[usize],
-        range: Range,
+        spec: crate::ops::SliceSpec,
     ) -> Result<AccessOp<Self::Slice, Self>, Error> {
         match self {
             #[cfg(feature = "opencl")]
-            Self::CL(cl) => cl.slice(access, shape, range).map(AccessOp::wrap),
-            Self::Host(host) => host.slice(access, shape, range).map(AccessOp::wrap),
-        }
-    }
-
-    fn transpose(
-        self,
-        access: A,
-        shape: Shape,
-        permutation: Axes,
-    ) -> Result<AccessOp<Self::Transpose, Self>, Error> {
-        match self {
-            #[cfg(feature = "opencl")]
-            Self::CL(cl) => cl.transpose(access, shape, permutation).map(AccessOp::wrap),
-            Self::Host(host) => host
-                .transpose(access, shape, permutation)
-                .map(AccessOp::wrap),
+            Self::CL(cl) => cl.slice(access, spec).map(AccessOp::wrap),
+            Self::Host(host) => host.slice(access, spec).map(AccessOp::wrap),
         }
     }
 }

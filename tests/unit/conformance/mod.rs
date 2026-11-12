@@ -36,14 +36,15 @@ pub fn close(actual: f64, expected: f64, bits: u32) {
 
 macro_rules! conformance_suite {
     () => {
-        use crate::conformance::close;
         use ha_ndarray::{
-            NDArrayAbs, NDArrayBoolean, NDArrayCast, NDArrayCompare, NDArrayMath, NDArrayMathScalar,
-            NDArrayNumeric, NDArrayRead, NDArrayReduceAll, NDArrayReduceBoolean, NDArrayTransform,
-            NDArrayTrig, NDArrayUnary, NDArrayUnaryBoolean,
+            NDArrayAbs, NDArrayBoolean, NDArrayCast, NDArrayCompare, NDArrayMath,
+            NDArrayMathScalar, NDArrayNumeric, NDArrayRead, NDArrayReduceAll, NDArrayReduceBoolean,
+            NDArrayTransform, NDArrayTrig, NDArrayUnary, NDArrayUnaryBoolean,
         };
-
+        use number_general::{NumberInstance, Trigonometry};
         use safecast::CastFrom;
+
+        use crate::conformance::close;
 
         #[test]
         fn exhaustive_byte_arithmetic() {
@@ -52,11 +53,7 @@ macro_rules! conformance_suite {
                     let a: Vec<$t> = (0..=255u16)
                         .flat_map(|a| std::iter::repeat_n(a as $t, 256))
                         .collect();
-                    let b: Vec<$t> = (0..=255u16)
-                        .cycle()
-                        .take(65536)
-                        .map(|b| b as $t)
-                        .collect();
+                    let b: Vec<$t> = (0..=255u16).cycle().take(65536).map(|b| b as $t).collect();
 
                     macro_rules! check {
                         ($op:ident, $expected:expr) => {{
@@ -77,12 +74,9 @@ macro_rules! conformance_suite {
                         }};
                     }
 
-                    check!(add, |a: $t, b: $t| (a as i128 + b as i128)
-                        as $t);
-                    check!(sub, |a: $t, b: $t| (a as i128 - b as i128)
-                        as $t);
-                    check!(mul, |a: $t, b: $t| (a as i128 * b as i128)
-                        as $t);
+                    check!(add, |a: $t, b: $t| (a as i128 + b as i128) as $t);
+                    check!(sub, |a: $t, b: $t| (a as i128 - b as i128) as $t);
+                    check!(mul, |a: $t, b: $t| (a as i128 * b as i128) as $t);
                     check!(div, |a: $t, b: $t| if b == 0 {
                         0
                     } else {
@@ -176,14 +170,7 @@ macro_rules! conformance_suite {
             macro_rules! check {
                 ($t:ty) => {{
                     let a = vec![<$t>::MIN, <$t>::MAX, 0, 1, 2, 3];
-                    let b = vec![
-                        (1 as $t).wrapping_neg(),
-                        2,
-                        0,
-                        <$t>::MAX,
-                        0,
-                        5
-                    ];
+                    let b = vec![(1 as $t).wrapping_neg(), 2, 0, <$t>::MAX, 0, 5];
                     let values = input(a.clone())
                         .div(input(b.clone()))
                         .unwrap()
@@ -193,8 +180,61 @@ macro_rules! conformance_suite {
                         .unwrap()
                         .into_vec();
 
-                    for ((a, b), v) in a.into_iter().zip(b).zip(values) {
+                    for ((a, b), v) in a.iter().copied().zip(b.iter().copied()).zip(values) {
+                        use number_general::NumberInstance;
+
+                        let scalar = number_general::Number::from(a)
+                            .try_div(number_general::Number::from(b));
                         assert_eq!(v, if b == 0 { 0 } else { a.wrapping_div(b) });
+                        let compatible = std::panic::catch_unwind(|| {
+                            number_general::Number::from(a)
+                                .wrapping_div(number_general::Number::from(b))
+                        });
+                        if b == 0 {
+                            // Scalar errors and array zero results are deliberate policies.
+                            assert!(scalar.is_err());
+                            assert!(compatible.is_err());
+                        } else {
+                            let compatible = compatible.unwrap();
+                            assert_eq!(compatible, number_general::Number::from(v));
+                            assert_eq!(compatible.class(), number_general::Number::from(v).class());
+                            let quotient_overflow = a.checked_div(b).is_none();
+                            if quotient_overflow {
+                                assert_eq!(
+                                    scalar.unwrap_err().kind(),
+                                    number_general::ErrorKind::Overflow
+                                );
+                            } else {
+                                assert_eq!(scalar.unwrap(), number_general::Number::from(v));
+                            }
+                        }
+                    }
+
+                    let remainders = input(a.clone())
+                        .rem(input(b.clone()))
+                        .unwrap()
+                        .buffer()
+                        .unwrap()
+                        .to_slice()
+                        .unwrap()
+                        .into_vec();
+                    for ((a, b), v) in a.into_iter().zip(b).zip(remainders) {
+                        use number_general::NumberInstance;
+
+                        let scalar = number_general::Number::from(a)
+                            .try_rem(number_general::Number::from(b));
+                        assert_eq!(v, if b == 0 { 0 } else { a.wrapping_rem(b) });
+                        let compatible = std::panic::catch_unwind(|| {
+                            number_general::Number::from(a)
+                                .wrapping_rem(number_general::Number::from(b))
+                        });
+                        if b == 0 {
+                            assert!(scalar.is_err());
+                            assert!(compatible.is_err());
+                        } else {
+                            assert_eq!(compatible.unwrap(), number_general::Number::from(v));
+                            assert_eq!(scalar.unwrap(), number_general::Number::from(v));
+                        }
                     }
 
                     let high = <$t>::MAX;
@@ -259,17 +299,21 @@ macro_rules! conformance_suite {
                     ];
 
                     macro_rules! check {
-                        ($op:ident, $reference:ident) => {{
+                        ($op:ident, $reference:ident, $scalar:ident) => {{
                             let expression = input(values.clone()).$op().unwrap();
-                            let result = expression.buffer().unwrap().to_slice().unwrap().into_vec();
+                            let result =
+                                expression.buffer().unwrap().to_slice().unwrap().into_vec();
 
                             for (i, (&x, &actual)) in values.iter().zip(&result).enumerate() {
                                 let expected = crate::conformance::oracle::real(
                                     x as f64,
                                     $bits,
-                                    stringify!($reference)
+                                    stringify!($reference),
                                 ) as $t;
                                 close(actual as f64, expected as f64, $bits);
+                                let scalar = number_general::Number::from(x).$scalar();
+                                assert_eq!(scalar.class(), number_general::Number::from(x).class());
+                                close(<$t>::cast_from(scalar) as f64, expected as f64, $bits);
                                 close(
                                     expression.read_value(&[i]).unwrap() as f64,
                                     expected as f64,
@@ -279,19 +323,19 @@ macro_rules! conformance_suite {
                         }};
                     }
 
-                    check!(exp, exp);
-                    check!(ln, ln);
-                    check!(sin, sin);
-                    check!(cos, cos);
-                    check!(tan, tan);
-                    check!(asin, asin);
-                    check!(acos, acos);
-                    check!(atan, atan);
-                    check!(sinh, sinh);
-                    check!(cosh, cosh);
-                    check!(tanh, tanh);
-                    check!(round, round);
-                    check!(abs, abs);
+                    check!(exp, exp, exp);
+                    check!(ln, ln, ln);
+                    check!(sin, sin, sin);
+                    check!(cos, cos, cos);
+                    check!(tan, tan, tan);
+                    check!(asin, asin, asin);
+                    check!(acos, acos, acos);
+                    check!(atan, atan, atan);
+                    check!(sinh, sinh, sinh);
+                    check!(cosh, cosh, cosh);
+                    check!(tanh, tanh, tanh);
+                    check!(round, round, round);
+                    check!(abs, abs, abs);
                 }};
             }
 
@@ -312,12 +356,12 @@ macro_rules! conformance_suite {
                         <$t>::MIN_POSITIVE,
                         <$t>::from_bits(1),
                         <$t>::INFINITY,
-                        <$t>::NAN
+                        <$t>::NAN,
                     ];
                     let b: Vec<$t> = vec![0., 2., 0., 0., 0.5, 2., 1., 2., 2.];
 
                     macro_rules! check {
-                        ($op:ident, $operator:tt) => {{
+                        ($op:ident, $scalar:ident) => {{
                             let expr = input(a.clone()).$op(input(b.clone())).unwrap();
                             let result = expr.buffer().unwrap().to_slice().unwrap().into_vec();
 
@@ -326,9 +370,14 @@ macro_rules! conformance_suite {
                                     *a as f64,
                                     *b as f64,
                                     $bits,
-                                    stringify!($op)
+                                    stringify!($op),
                                 );
                                 let expected = reference as $t;
+                                let scalar = <$t>::cast_from(
+                                    number_general::Number::from(*a)
+                                        .$scalar(number_general::Number::from(*b)),
+                                );
+                                close(scalar as f64, expected as f64, $bits);
 
                                 if expected.is_nan() {
                                     assert!(actual.is_nan());
@@ -344,17 +393,15 @@ macro_rules! conformance_suite {
                         }};
                     }
 
-                    check!(add, +);
-                    check!(sub, -);
-                    check!(mul, *);
-                    check!(div, /);
-                    check!(rem, %);
+                    check!(add, wrapping_add);
+                    check!(sub, wrapping_sub);
+                    check!(mul, wrapping_mul);
+                    check!(div, wrapping_div);
+                    check!(rem, wrapping_rem);
 
                     for size in [1, 63, 64, 129, 8193] {
                         assert_eq!(
-                            input(vec![<$t>::NEG_INFINITY; size])
-                                .max_all()
-                                .unwrap(),
+                            input(vec![<$t>::NEG_INFINITY; size]).max_all().unwrap(),
                             <$t>::NEG_INFINITY
                         );
                         assert_eq!(
@@ -369,17 +416,11 @@ macro_rules! conformance_suite {
                     }
 
                     assert_eq!(
-                        input(vec![-0. as $t, 0.])
-                            .min_all()
-                            .unwrap()
-                            .to_bits(),
+                        input(vec![-0. as $t, 0.]).min_all().unwrap().to_bits(),
                         (-0. as $t).to_bits()
                     );
                     assert_eq!(
-                        input(vec![-0. as $t, 0.])
-                            .max_all()
-                            .unwrap()
-                            .to_bits(),
+                        input(vec![-0. as $t, 0.]).max_all().unwrap().to_bits(),
                         (0. as $t).to_bits()
                     );
                     assert_eq!(
@@ -567,6 +608,28 @@ macro_rules! conformance_suite {
                 a.buffer().unwrap().to_slice().unwrap().into_vec(),
                 vec![16_777_216.]
             );
+
+            for (source, dtype, expected) in [
+                (
+                    number_general::Number::from(-1i8),
+                    number_general::NumberType::UInt(number_general::UIntType::U64),
+                    number_general::Number::from(255u64),
+                ),
+                (
+                    number_general::Number::from(u32::MAX),
+                    number_general::NumberType::Int(number_general::IntType::I64),
+                    number_general::Number::from(-1i64),
+                ),
+                (
+                    number_general::Number::from(16_777_217i32),
+                    number_general::NumberType::Float(number_general::FloatType::F64),
+                    number_general::Number::from(16_777_216f64),
+                ),
+            ] {
+                let actual = source.into_type(dtype);
+                assert_eq!(actual, expected);
+                assert_eq!(actual.class(), dtype);
+            }
         }
 
         #[test]
@@ -593,13 +656,25 @@ macro_rules! conformance_suite {
                         .into_vec();
 
                     for (i, ((&a, &b), v)) in a.iter().zip(&b).zip(actual).enumerate() {
-                        let pow = crate::conformance::oracle::real_binary(a as f64, b as f64, $bits, "pow")
-                            as $t;
+                        let pow = crate::conformance::oracle::real_binary(
+                            a as f64, b as f64, $bits, "pow",
+                        ) as $t;
                         close(v as f64, pow as f64, $bits);
+                        let scalar = <$t>::cast_from(
+                            number_general::Number::from(a)
+                                .wrapping_pow(number_general::Number::from(b)),
+                        );
+                        close(scalar as f64, pow as f64, $bits);
                         let base = (b.abs() + 0.5) as f64;
-                        let log = crate::conformance::oracle::real_binary(a as f64, base, $bits, "log")
-                            as $t;
+                        let log =
+                            crate::conformance::oracle::real_binary(a as f64, base, $bits, "log")
+                                as $t;
                         close(logs[i] as f64, log as f64, $bits);
+                        let scalar = <$t>::cast_from(
+                            number_general::Number::from(a)
+                                .log(number_general::Number::from(base as $t)),
+                        );
+                        close(scalar as f64, log as f64, $bits);
                     }
 
                     let a = input(vec![0. as $t, <$t>::NAN, 1., -1.])
@@ -620,19 +695,14 @@ macro_rules! conformance_suite {
         fn scalar_array_and_point_parity() {
             macro_rules! dtype {
                 ($t:ty) => {{
-                    let values: Vec<$t> = vec![
-                        0 as $t,
-                        1 as $t,
-                        2 as $t,
-                        3 as $t,
-                        <$t>::MAX
-                    ];
+                    let values: Vec<$t> = vec![0 as $t, 1 as $t, 2 as $t, 3 as $t, <$t>::MAX];
 
                     macro_rules! check {
                         ($op:ident,$scalar:ident) => {{
                             for rhs in [0 as $t, 2 as $t, 3 as $t] {
                                 let expression = input(values.clone()).$scalar(rhs).unwrap();
-                                let scalar = expression.buffer().unwrap().to_slice().unwrap().into_vec();
+                                let scalar =
+                                    expression.buffer().unwrap().to_slice().unwrap().into_vec();
                                 let array = input(values.clone())
                                     .$op(input(vec![rhs; values.len()]))
                                     .unwrap()
@@ -732,7 +802,7 @@ macro_rules! conformance_suite {
                     ];
 
                     macro_rules! check {
-                        ($op:ident) => {{
+                        ($op:ident, $scalar:ident) => {{
                             let expr = input(values.clone()).$op().unwrap();
                             let actual = expr.buffer().unwrap().to_slice().unwrap().into_vec();
 
@@ -740,17 +810,26 @@ macro_rules! conformance_suite {
                                 let expected = crate::conformance::oracle::complex(
                                     (z.re as f64, z.im as f64),
                                     None,
-                                    if <$t>::MANTISSA_DIGITS == 24 {
-                                        32
-                                    } else {
-                                        64
-                                    },
+                                    if <$t>::MANTISSA_DIGITS == 24 { 32 } else { 64 },
                                     stringify!($op),
                                 );
 
-                                for (a, e) in [(a.re as f64, expected.0), (a.im as f64, expected.1)] {
+                                let scalar = number_general::Number::from(z).$scalar();
+                                let scalar = Complex::<$t>::cast_from(scalar);
+                                for (a, e) in [
+                                    (scalar.re as f64, expected.0),
+                                    (scalar.im as f64, expected.1),
+                                ] {
                                     assert!(
-                                        (a - e).abs() <= 16. * <$t>::EPSILON as f64 * e.abs().max(1.),
+                                        (a - e).abs()
+                                            <= 16. * <$t>::EPSILON as f64 * e.abs().max(1.)
+                                    );
+                                }
+                                for (a, e) in [(a.re as f64, expected.0), (a.im as f64, expected.1)]
+                                {
+                                    assert!(
+                                        (a - e).abs()
+                                            <= 16. * <$t>::EPSILON as f64 * e.abs().max(1.),
                                         "{}({z:?}): {a} != {e}",
                                         stringify!($op)
                                     );
@@ -759,17 +838,17 @@ macro_rules! conformance_suite {
                         }};
                     }
 
-                    check!(exp);
-                    check!(ln);
-                    check!(sin);
-                    check!(cos);
-                    check!(tan);
-                    check!(sinh);
-                    check!(cosh);
-                    check!(tanh);
-                    check!(asin);
-                    check!(acos);
-                    check!(atan);
+                    check!(exp, exp);
+                    check!(ln, ln);
+                    check!(sin, sin);
+                    check!(cos, cos);
+                    check!(tan, tan);
+                    check!(sinh, sinh);
+                    check!(cosh, cosh);
+                    check!(tanh, tanh);
+                    check!(asin, asin);
+                    check!(acos, acos);
+                    check!(atan, atan);
                     // Pin num-complex's exact-cut and exceptional conventions separately
                     // from the independent MPC finite-accuracy cases above.
                     let edges = vec![
@@ -803,7 +882,11 @@ macro_rules! conformance_suite {
 
                                 for (a, b) in [(v.re, expected.re), (v.im, expected.im)] {
                                     if b.is_nan() {
-                                        assert!(a.is_nan(), "{}({z:?}): {a} != {b}", stringify!($op));
+                                        assert!(
+                                            a.is_nan(),
+                                            "{}({z:?}): {a} != {b}",
+                                            stringify!($op)
+                                        );
                                     } else if b == 0. || b.is_infinite() {
                                         assert_eq!(
                                             a.to_bits(),
@@ -915,6 +998,7 @@ macro_rules! conformance_suite {
                             .into_vec(),
                         vec![Complex::new(3., -4.), Complex::new(-0., 1.)]
                     );
+
                     let angles = input(components)
                         .angle()
                         .unwrap()
@@ -924,10 +1008,10 @@ macro_rules! conformance_suite {
                         .unwrap()
                         .into_vec();
 
-                    assert!((angles[0] as f64 - 0.9272952180016122).abs() <= 8. * <$t>::EPSILON as f64);
-                    let abs = input(vec![Complex::<$t>::new(3., 4.)])
-                        .abs()
-                        .unwrap();
+                    assert!(
+                        (angles[0] as f64 - 0.9272952180016122).abs() <= 8. * <$t>::EPSILON as f64
+                    );
+                    let abs = input(vec![Complex::<$t>::new(3., 4.)]).abs().unwrap();
 
                     assert_eq!(
                         abs.buffer().unwrap().to_slice().unwrap().into_vec(),
@@ -964,28 +1048,31 @@ macro_rules! conformance_suite {
                     let right = vec![Complex::<$t>::new(0.5, -0.25); 3];
 
                     macro_rules! check {
-                        ($op:ident) => {{
-                            let expression = input(left.clone())
-                                .$op(input(right.clone()))
-                                .unwrap();
-                            let values = expression.buffer().unwrap().to_slice().unwrap().into_vec();
+                        ($op:ident, $scalar:ident) => {{
+                            let expression = input(left.clone()).$op(input(right.clone())).unwrap();
+                            let values =
+                                expression.buffer().unwrap().to_slice().unwrap().into_vec();
 
-                            for (i, ((a, b), v)) in left.iter().zip(&right).zip(values).enumerate() {
+                            for (i, ((a, b), v)) in left.iter().zip(&right).zip(values).enumerate()
+                            {
                                 let reference = crate::conformance::oracle::complex(
                                     (a.re as f64, a.im as f64),
                                     Some((b.re as f64, b.im as f64)),
-                                    if <$t>::MANTISSA_DIGITS == 24 {
-                                        32
-                                    } else {
-                                        64
-                                    },
+                                    if <$t>::MANTISSA_DIGITS == 24 { 32 } else { 64 },
                                     stringify!($op),
                                 );
 
-                                for v in [v, expression.read_value(&[i]).unwrap()] {
-                                    for (v, r) in [(v.re as f64, reference.0), (v.im as f64, reference.1)] {
+                                let scalar = Complex::<$t>::cast_from(
+                                    number_general::Number::from(*a)
+                                        .$scalar(number_general::Number::from(*b)),
+                                );
+                                for v in [v, expression.read_value(&[i]).unwrap(), scalar] {
+                                    for (v, r) in
+                                        [(v.re as f64, reference.0), (v.im as f64, reference.1)]
+                                    {
                                         assert!(
-                                            (v - r).abs() <= 16. * <$t>::EPSILON as f64 * r.abs().max(1.),
+                                            (v - r).abs()
+                                                <= 16. * <$t>::EPSILON as f64 * r.abs().max(1.),
                                             "{}({a},{b}): {v} != {r}",
                                             stringify!($op)
                                         );
@@ -995,23 +1082,20 @@ macro_rules! conformance_suite {
                         }};
                     }
 
-                    check!(add);
-                    check!(sub);
-                    check!(mul);
-                    check!(div);
-                    check!(pow);
-                    check!(log);
-                    let branch = input(vec![
-                        Complex::<$t>::new(-1., 0.),
-                        Complex::new(-1., -0.)
-                    ])
-                    .ln()
-                    .unwrap()
-                    .buffer()
-                    .unwrap()
-                    .to_slice()
-                    .unwrap()
-                    .into_vec();
+                    check!(add, wrapping_add);
+                    check!(sub, wrapping_sub);
+                    check!(mul, wrapping_mul);
+                    check!(div, wrapping_div);
+                    check!(pow, wrapping_pow);
+                    check!(log, log);
+                    let branch = input(vec![Complex::<$t>::new(-1., 0.), Complex::new(-1., -0.)])
+                        .ln()
+                        .unwrap()
+                        .buffer()
+                        .unwrap()
+                        .to_slice()
+                        .unwrap()
+                        .into_vec();
 
                     assert!(branch[0].im > 0. && branch[1].im < 0.);
                     let zeros = input(vec![Complex::<$t>::new(0., 0.); 2])
@@ -1110,6 +1194,139 @@ macro_rules! conformance_suite {
                     .into_vec(),
                 vec![0.375; 4]
             );
+        }
+
+        #[test]
+        fn singleton_reductions_forward_values() {
+            use ha_ndarray::{axes, NDArray, NDArrayReduce};
+
+            macro_rules! dtype {
+                ($t:ty) => {{
+                    for size in [1, 65] {
+                        let cases: [$t; 8] = [
+                            -0.,
+                            0.,
+                            1.,
+                            -1.,
+                            <$t>::INFINITY,
+                            <$t>::NEG_INFINITY,
+                            <$t>::NAN,
+                            <$t>::from_bits(1),
+                        ];
+                        let values: Vec<_> = cases.into_iter().cycle().take(size).collect();
+                        let source = input(values.clone()).reshape(shape![size, 1]).unwrap();
+                        for axes in [axes![], axes![1]] {
+                            for keepdims in [false, true] {
+                                macro_rules! check {
+                                    ($op:ident) => {{
+                                        let result =
+                                            source.as_ref().$op(axes.clone(), keepdims).unwrap();
+                                        let shape = if axes.is_empty() || keepdims {
+                                            vec![size, 1]
+                                        } else {
+                                            vec![size]
+                                        };
+                                        assert_eq!(result.shape(), &shape);
+                                        let buffered =
+                                            result.buffer().unwrap().to_slice().unwrap().into_vec();
+                                        for (i, (&expected, actual)) in
+                                            values.iter().zip(buffered).enumerate()
+                                        {
+                                            let coord = if shape.len() == 2 {
+                                                vec![i, 0]
+                                            } else {
+                                                vec![i]
+                                            };
+                                            for actual in
+                                                [actual, result.read_value(&coord).unwrap()]
+                                            {
+                                                if expected.is_nan() {
+                                                    assert!(actual.is_nan());
+                                                } else {
+                                                    assert_eq!(
+                                                        actual.to_bits(),
+                                                        expected.to_bits()
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }};
+                                }
+                                check!(sum);
+                                check!(product);
+                                check!(min);
+                                check!(max);
+                            }
+                        }
+                    }
+                    let scalar = input(vec![-0. as $t]).sum(axes![0], false).unwrap();
+                    assert!(scalar.shape().is_empty());
+                    assert_eq!(
+                        scalar.read_value(&[]).unwrap().to_bits(),
+                        (-0. as $t).to_bits()
+                    );
+                    assert_eq!(
+                        scalar.buffer().unwrap().to_slice().unwrap()[0].to_bits(),
+                        (-0. as $t).to_bits()
+                    );
+                    let scalar = scalar.sum(axes![], true).unwrap();
+                    assert!(scalar.shape().is_empty());
+                    assert_eq!(
+                        scalar.read_value(&[]).unwrap().to_bits(),
+                        (-0. as $t).to_bits()
+                    );
+                }};
+            }
+            dtype!(f32);
+            dtype!(f64);
+        }
+
+        #[cfg(feature = "complex")]
+        #[test]
+        fn singleton_complex_reductions_forward_values() {
+            use ha_ndarray::{axes, complex::Complex, NDArrayReduce};
+            macro_rules! dtype {
+                ($t:ty) => {{
+                    let cases = [
+                        Complex::<$t>::new(-0., 0.),
+                        Complex::new(0., -0.),
+                        Complex::new(2., -3.),
+                        Complex::new(<$t>::INFINITY, 1.),
+                        Complex::new(<$t>::NAN, -0.),
+                    ];
+                    let values: Vec<_> = cases.into_iter().cycle().take(65).collect();
+                    let source = input(values.clone()).reshape(shape![65, 1]).unwrap();
+                    for keepdims in [false, true] {
+                        macro_rules! check {
+                            ($op:ident) => {{
+                                let result = source.as_ref().$op(axes![1], keepdims).unwrap();
+                                let buffered =
+                                    result.buffer().unwrap().to_slice().unwrap().into_vec();
+                                for (i, (&expected, actual)) in
+                                    values.iter().zip(buffered).enumerate()
+                                {
+                                    let coord = if keepdims { vec![i, 0] } else { vec![i] };
+                                    for actual in [actual, result.read_value(&coord).unwrap()] {
+                                        for (a, e) in
+                                            [(actual.re, expected.re), (actual.im, expected.im)]
+                                        {
+                                            if e.is_nan() {
+                                                assert!(a.is_nan());
+                                            } else {
+                                                assert_eq!(a.to_bits(), e.to_bits());
+                                            }
+                                        }
+                                    }
+                                }
+                            }};
+                        }
+                        check!(sum);
+                        check!(product);
+                    }
+                }};
+            }
+            dtype!(f32);
+            dtype!(f64);
         }
 
         aggregate_suite!();

@@ -36,11 +36,11 @@ where
 }
 
 // TODO: add OpenCL support for FFT
-pub enum FFT<A, T> {
-    Host(host::FFT<A, T>),
+pub enum Fft<A, T> {
+    Host(host::Fft<A, T>),
 }
 
-impl<A: Access<T>, T: Number> Op for FFT<A, T> {
+impl<A: Access<T>, T: Number> Op for Fft<A, T> {
     fn size(&self) -> usize {
         match self {
             Self::Host(fft) => fft.size(),
@@ -48,7 +48,7 @@ impl<A: Access<T>, T: Number> Op for FFT<A, T> {
     }
 }
 
-impl<A, T> Enqueue<Platform, num_complex::Complex<T>> for FFT<A, num_complex::Complex<T>>
+impl<A, T> Enqueue<Platform, num_complex::Complex<T>> for Fft<A, num_complex::Complex<T>>
 where
     A: Access<num_complex::Complex<T>>,
     T: FftNum,
@@ -61,9 +61,15 @@ where
             Self::Host(op) => Enqueue::<Host, _>::enqueue(op).map(Buffer::Host),
         }
     }
+
+    fn into_enqueue(self) -> Result<Self::Buffer, Error> {
+        match self {
+            Self::Host(op) => Enqueue::<Host, _>::into_enqueue(op).map(Buffer::Host),
+        }
+    }
 }
 
-impl<A: Access<T>, T: Number> ReadValue<Platform, T> for FFT<A, T> {
+impl<A: Access<T>, T: Number> ReadValue<Platform, T> for Fft<A, T> {
     fn read_value(&self, offset: usize) -> Result<T, Error> {
         match self {
             Self::Host(fft) => ReadValue::read_value(fft, offset),
@@ -71,8 +77,8 @@ impl<A: Access<T>, T: Number> ReadValue<Platform, T> for FFT<A, T> {
     }
 }
 
-impl<A, T> From<host::FFT<A, T>> for FFT<A, T> {
-    fn from(op: host::FFT<A, T>) -> Self {
+impl<A, T> From<host::Fft<A, T>> for Fft<A, T> {
+    fn from(op: host::Fft<A, T>) -> Self {
         Self::Host(op)
     }
 }

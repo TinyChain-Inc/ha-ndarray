@@ -4,10 +4,9 @@ use std::ops::Deref;
 
 use smallvec::SmallVec;
 
+use super::VEC_MIN_SIZE;
 use crate::buffer::{BufferConverter, BufferInstance, BufferMut};
 use crate::{Error, Number};
-
-use super::VEC_MIN_SIZE;
 
 /// A stack-allocated buffer.
 pub type StackVec<T> = SmallVec<[T; VEC_MIN_SIZE]>;
@@ -15,6 +14,10 @@ pub type StackVec<T> = SmallVec<[T; VEC_MIN_SIZE]>;
 impl<T: Number> BufferInstance<T> for StackVec<T> {
     fn read(&self) -> BufferConverter<'_, T> {
         self.as_slice().into()
+    }
+
+    fn into_buffer(self) -> Result<crate::Buffer<T>, Error> {
+        Ok(self.into())
     }
 
     fn read_value(&self, offset: usize) -> Result<T, Error> {
@@ -43,6 +46,10 @@ impl<T: Number> BufferMut<T> for StackVec<T> {
 impl<T: Number> BufferInstance<T> for Vec<T> {
     fn read(&self) -> BufferConverter<'_, T> {
         self.as_slice().into()
+    }
+
+    fn into_buffer(self) -> Result<crate::Buffer<T>, Error> {
+        Ok(self.into())
     }
 
     fn read_value(&self, offset: usize) -> Result<T, Error> {
@@ -140,6 +147,16 @@ pub enum Buffer<T> {
     Stack(StackVec<T>),
 }
 
+impl<T> get_size::GetSize for Buffer<T> {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Heap(values) => values.capacity() * std::mem::size_of::<T>(),
+            Self::Stack(values) if values.spilled() => values.capacity() * std::mem::size_of::<T>(),
+            Self::Stack(_) => 0,
+        }
+    }
+}
+
 impl<T: Clone> Buffer<T> {
     pub fn into_vec(self) -> Vec<T> {
         match self {
@@ -177,6 +194,10 @@ impl<T> AsMut<[T]> for Buffer<T> {
 impl<T: Number> BufferInstance<T> for Buffer<T> {
     fn read(&self) -> BufferConverter<'_, T> {
         BufferConverter::Host(self.into())
+    }
+
+    fn into_buffer(self) -> Result<crate::Buffer<T>, Error> {
+        Ok(self.into())
     }
 
     fn read_value(&self, offset: usize) -> Result<T, Error> {

@@ -2,14 +2,14 @@
 
 use std::marker::PhantomData;
 
-use crate::access::*;
+use crate::access::{Access, AccessOp};
 use crate::buffer::Buffer;
 #[cfg(feature = "opencl")]
 use crate::opencl;
 use crate::platform::{Platform, PlatformInstance};
 use crate::{
-    host, range_shape, strides_for, Axes, AxisRange, BufferConverter, Error, Float, Number, Range,
-    Real, Shape, Strides,
+    checked_size, host, range_shape, strides_for, Axes, AxisRange, BufferConverter, Error, Float,
+    Number, Range, Real, Shape, Strides,
 };
 
 #[cfg(feature = "complex")]
@@ -43,6 +43,14 @@ pub trait Enqueue<P: PlatformInstance, T: Number>: Op {
     type Buffer: Into<BufferConverter<'static, T>>;
 
     fn enqueue(&self) -> Result<Self::Buffer, Error>;
+
+    /// Consume this operation, reusing owned inputs when its implementation supports it.
+    fn into_enqueue(self) -> Result<Self::Buffer, Error>
+    where
+        Self: Sized,
+    {
+        self.enqueue()
+    }
 }
 
 pub trait ReadValue<P: PlatformInstance, T: Number>: Op {
@@ -64,14 +72,6 @@ where
 {
 }
 
-pub trait Write<P: PlatformInstance, T: Number>: Enqueue<P, T> {
-    fn write<'a>(&mut self, data: BufferConverter<'a, T>) -> Result<(), Error>;
-
-    fn write_value(&mut self, value: T) -> Result<(), Error>;
-
-    fn write_value_at(&mut self, offset: usize, value: T) -> Result<(), Error>;
-}
-
 pub trait ConstructConcat<A, T>: PlatformInstance
 where
     A: Access<T>,
@@ -86,6 +86,85 @@ pub trait ConstructRange<T: Number>: PlatformInstance {
     type Range: Enqueue<Self, T>;
 
     fn range(self, start: T, stop: T, size: usize) -> Result<AccessOp<Self::Range, Self>, Error>;
+}
+
+// Derive parameters before constructing either backend's linear operation.
+// Integer evaluation keeps its wrapping arithmetic and truncated step, but span
+// and cardinality must not wrap while deriving that step.
+pub(crate) fn range_step<T: Number + PartialOrd>(
+    start: T,
+    stop: T,
+    size: usize,
+) -> Result<T, Error> {
+    use number_general::Number as Numeric;
+
+    if start.partial_cmp(&stop).is_none_or(|order| order.is_gt()) {
+        return Err(Error::bounds(format!("invalid range: [{start}, {stop})")));
+    }
+
+    let unsupported = || {
+        Error::unsupported("range cannot be represented by this dtype's linear operation".into())
+    };
+    let step = match (start.into(), stop.into()) {
+        (Numeric::Int(left), Numeric::Int(right)) => {
+            if size < 2 {
+                return Ok(T::ZERO);
+            }
+
+            let span = i128::from(i64::from(right)) - i128::from(i64::from(left));
+            let step = i64::try_from(span / size as i128).map_err(|_| unsupported())?;
+            Numeric::from(step)
+        }
+        (Numeric::UInt(left), Numeric::UInt(right)) => {
+            if size < 2 {
+                return Ok(T::ZERO);
+            }
+
+            let span = u128::from(u64::from(right)) - u128::from(u64::from(left));
+            let step = u64::try_from(span / size as u128).map_err(|_| unsupported())?;
+            Numeric::from(step)
+        }
+        (Numeric::Float(left), Numeric::Float(right)) => {
+            let left = f64::from(left);
+            let right = f64::from(right);
+            if !left.is_finite() || !right.is_finite() {
+                return Err(unsupported());
+            }
+            if size < 2 {
+                return Ok(T::ZERO);
+            }
+
+            let count = size as f64;
+            let span = right - left;
+            let step = if span.is_finite() {
+                span / count
+            } else {
+                right / count - left / count
+            };
+            let step = T::cast_from(Numeric::from(step));
+            let last = T::add(
+                start,
+                T::mul(T::cast_from(Numeric::from((size - 1) as u64)), step),
+            );
+            let Numeric::Float(last) = last.into() else {
+                return Err(unsupported());
+            };
+            let last = f64::from(last);
+            if !last.is_finite() || last < left || last > right {
+                return Err(unsupported());
+            }
+
+            return Ok(step);
+        }
+        _ => return Err(unsupported()),
+    };
+
+    let typed = T::cast_from(step);
+    if typed.into() != step {
+        return Err(unsupported());
+    }
+
+    Ok(typed)
 }
 
 pub trait ElementwiseAbs<A, T>: PlatformInstance
@@ -333,13 +412,10 @@ where
     ) -> Result<AccessOp<Self::Op, Self>, Error>;
 }
 
-pub trait Random: PlatformInstance {
-    type Normal: Enqueue<Self, f32>;
-    type Uniform: Enqueue<Self, f32>;
+pub trait Random: crate::platform::Convert<f32> {
+    fn random_normal(self, size: usize) -> Result<Self::Buffer, Error>;
 
-    fn random_normal(self, size: usize) -> Result<AccessOp<Self::Normal, Self>, Error>;
-
-    fn random_uniform(self, size: usize) -> Result<AccessOp<Self::Uniform, Self>, Error>;
+    fn random_uniform(self, size: usize) -> Result<Self::Buffer, Error>;
 }
 
 pub trait ReduceAll<A, T>: PlatformInstance {
@@ -377,38 +453,15 @@ pub trait ReduceAxes<A: Access<T>, T: Number>: PlatformInstance {
 }
 
 pub trait Transform<A: Access<T>, T: Number>: PlatformInstance {
-    type Broadcast: ReadOp<Self, T>;
+    type View: ReadOp<Self, T>;
     type Flip: ReadOp<Self, T>;
     type Slice: ReadOp<Self, T>;
-    type Transpose: ReadOp<Self, T>;
 
-    fn broadcast(
-        self,
-        access: A,
-        shape: Shape,
-        broadcast: Shape,
-    ) -> Result<AccessOp<Self::Broadcast, Self>, Error>;
+    fn view(self, access: A, spec: ViewSpec) -> Result<AccessOp<Self::View, Self>, Error>;
 
-    fn flip(
-        self,
-        access: A,
-        shape: Shape,
-        axis: usize,
-    ) -> Result<AccessOp<Self::Flip, Self>, Error>;
+    fn flip(self, access: A, spec: FlipSpec) -> Result<AccessOp<Self::Flip, Self>, Error>;
 
-    fn slice(
-        self,
-        access: A,
-        shape: &[usize],
-        range: Range,
-    ) -> Result<AccessOp<Self::Slice, Self>, Error>;
-
-    fn transpose(
-        self,
-        access: A,
-        shape: Shape,
-        permutation: Axes,
-    ) -> Result<AccessOp<Self::Transpose, Self>, Error>;
+    fn slice(self, access: A, spec: SliceSpec) -> Result<AccessOp<Self::Slice, Self>, Error>;
 }
 
 pub enum Cast<A, IT, OT> {
@@ -802,71 +855,6 @@ impl<L, R, T> From<host::ops::MatMul<L, R, T>> for MatMul<L, R, T> {
     }
 }
 
-pub enum RandomNormal {
-    #[cfg(feature = "opencl")]
-    CL(opencl::ops::RandomNormal),
-    Host(host::ops::RandomNormal),
-}
-
-#[cfg(feature = "opencl")]
-impl From<opencl::ops::RandomNormal> for RandomNormal {
-    fn from(op: opencl::ops::RandomNormal) -> Self {
-        Self::CL(op)
-    }
-}
-
-impl From<host::ops::RandomNormal> for RandomNormal {
-    fn from(op: host::ops::RandomNormal) -> Self {
-        Self::Host(op)
-    }
-}
-
-pub enum RandomUniform {
-    #[cfg(feature = "opencl")]
-    CL(opencl::ops::RandomUniform),
-    Host(host::ops::RandomUniform),
-}
-
-#[cfg(feature = "opencl")]
-impl From<opencl::ops::RandomUniform> for RandomUniform {
-    fn from(op: opencl::ops::RandomUniform) -> Self {
-        Self::CL(op)
-    }
-}
-
-impl From<host::ops::RandomUniform> for RandomUniform {
-    fn from(op: host::ops::RandomUniform) -> Self {
-        Self::Host(op)
-    }
-}
-
-macro_rules! impl_random {
-    ($t:ty) => {
-        impl Op for $t {
-            fn size(&self) -> usize {
-                op_dispatch!(self, op, op.size())
-            }
-        }
-
-        impl Enqueue<Platform, f32> for $t {
-            type Buffer = Buffer<f32>;
-
-            fn enqueue(&self) -> Result<Self::Buffer, Error> {
-                op_enqueue!(self, f32)
-            }
-        }
-
-        impl ReadValue<Platform, f32> for $t {
-            fn read_value(&self, offset: usize) -> Result<f32, Error> {
-                op_dispatch!(self, op, op.read_value(offset))
-            }
-        }
-    };
-}
-
-impl_random!(RandomNormal);
-impl_random!(RandomUniform);
-
 macro_rules! impl_unary {
     ($op:ty, $t:ty) => {
         impl<A: Access<T>, T: Number> Op for $op {
@@ -912,32 +900,86 @@ impl<A, T: Number> From<opencl::ops::Reduce<A, T>> for Reduce<A, T> {
     }
 }
 
+/// Validated, normalized slice metadata for internal construction.
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct SliceSpec {
-    pub range: Range,
-    pub shape: Shape,
-    pub strides: Strides,
-    pub source_strides: Strides,
+    range: Range,
+    shape: Shape,
+    strides: Strides,
+    source_strides: Strides,
+    source_size: usize,
 }
 
 impl SliceSpec {
-    pub fn new(source_shape: &[usize], range: Range) -> Self {
-        debug_assert!(range.len() <= source_shape.len());
+    pub fn new(source_shape: &[usize], mut range: Range) -> Result<Self, Error> {
+        if range.len() > source_shape.len() {
+            return Err(Error::bounds("slice has more axes than its source".into()));
+        }
 
+        for (dim, range) in source_shape.iter().zip(&range) {
+            match range {
+                AxisRange::At(i) if i < dim => Ok(()),
+                AxisRange::In(start, stop, step) if *step != 0 && start <= stop && stop <= dim => {
+                    Ok(())
+                }
+                AxisRange::Of(indices) if indices.iter().all(|i| i < dim) => Ok(()),
+                range => Err(Error::bounds(format!(
+                    "invalid range {range:?} for dimension {dim}"
+                ))),
+            }?;
+        }
+
+        for dim in source_shape.iter().skip(range.len()).copied() {
+            range.push(AxisRange::In(0, dim, 1));
+        }
+
+        let source_size = checked_size(source_shape)?;
         let shape = range_shape(source_shape, &range);
+        checked_size(&shape)?;
         let strides = strides_for(&shape, shape.len()).collect();
         let source_strides = strides_for(source_shape, source_shape.len()).collect();
 
-        Self {
+        Ok(Self {
             range,
             shape,
             strides,
             source_strides,
+            source_size,
+        })
+    }
+
+    pub fn range(&self) -> &Range {
+        &self.range
+    }
+
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+
+    pub fn strides(&self) -> &Strides {
+        &self.strides
+    }
+
+    pub fn source_strides(&self) -> &Strides {
+        &self.source_strides
+    }
+
+    pub fn source_size(&self) -> usize {
+        self.source_size
+    }
+
+    pub(crate) fn check_source(&self, size: usize) -> Result<(), Error> {
+        if size == self.source_size {
+            Ok(())
+        } else {
+            Err(Error::bounds(format!(
+                "slice source has {size} elements, expected {}",
+                self.source_size
+            )))
         }
     }
 
-    pub fn source_offset(&self, offset: usize) -> usize {
-        debug_assert!(!self.shape.is_empty());
+    pub(crate) fn source_offset(&self, offset: usize) -> usize {
         debug_assert_eq!(self.shape.len(), self.strides.len());
 
         let mut coord = self
@@ -1037,59 +1079,6 @@ pub enum Slice<A, T> {
 impl_unary!(Slice<A, T>, T);
 
 #[cfg(feature = "opencl")]
-impl<A, T> Write<Platform, T> for Slice<A, T>
-where
-    A: AccessMut<T> + std::fmt::Debug,
-    T: Number,
-{
-    fn write<'a>(&mut self, data: BufferConverter<'a, T>) -> Result<(), Error> {
-        match self {
-            Self::CL(op) => Write::<opencl::OpenCL, T>::write(op, data),
-            Self::Host(op) => Write::<host::Host, T>::write(op, data),
-        }
-    }
-
-    fn write_value(&mut self, value: T) -> Result<(), Error> {
-        match self {
-            Self::CL(op) => Write::<opencl::OpenCL, T>::write_value(op, value),
-            Self::Host(op) => Write::<host::Host, T>::write_value(op, value),
-        }
-    }
-
-    fn write_value_at(&mut self, offset: usize, value: T) -> Result<(), Error> {
-        match self {
-            Self::CL(op) => Write::<opencl::OpenCL, T>::write_value_at(op, offset, value),
-            Self::Host(op) => Write::<host::Host, T>::write_value_at(op, offset, value),
-        }
-    }
-}
-
-#[cfg(not(feature = "opencl"))]
-impl<A, T> Write<Platform, T> for Slice<A, T>
-where
-    T: Number,
-    A: AccessMut<T>,
-{
-    fn write<'a>(&mut self, data: BufferConverter<'a, T>) -> Result<(), Error> {
-        match self {
-            Self::Host(op) => Write::<host::Host, T>::write(op, data),
-        }
-    }
-
-    fn write_value(&mut self, value: T) -> Result<(), Error> {
-        match self {
-            Self::Host(op) => Write::<host::Host, T>::write_value(op, value),
-        }
-    }
-
-    fn write_value_at(&mut self, offset: usize, value: T) -> Result<(), Error> {
-        match self {
-            Self::Host(op) => Write::<host::Host, T>::write_value_at(op, offset, value),
-        }
-    }
-}
-
-#[cfg(feature = "opencl")]
 impl<A, T> From<opencl::ops::Slice<A, T>> for Slice<A, T> {
     fn from(op: opencl::ops::Slice<A, T>) -> Self {
         Self::CL(op)
@@ -1158,27 +1147,55 @@ impl<A, IT, OT> From<opencl::ops::Unary<A, IT, OT>> for Unary<A, IT, OT> {
 
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct FlipSpec {
-    pub shape: Shape,
-    pub strides: Strides,
-    pub axis: usize,
+    shape: Shape,
+    strides: Strides,
+    axis: usize,
+    size: usize,
 }
 
 impl FlipSpec {
     pub fn new(shape: Shape, axis: usize) -> Result<Self, Error> {
-        if axis < shape.len() {
-            let strides = strides_for(&shape, shape.len()).collect();
+        if axis >= shape.len() {
+            return Err(Error::bounds(format!("shape {shape:?} has no axis {axis}")));
+        }
 
-            Ok(Self {
-                shape,
-                strides,
-                axis,
-            })
+        let size = checked_size(&shape)?;
+        let strides = strides_for(&shape, shape.len()).collect();
+        Ok(Self {
+            shape,
+            strides,
+            axis,
+            size,
+        })
+    }
+
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+
+    pub fn strides(&self) -> &Strides {
+        &self.strides
+    }
+
+    pub fn axis(&self) -> usize {
+        self.axis
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn check_source(&self, size: usize) -> Result<(), Error> {
+        if size == self.size {
+            Ok(())
         } else {
-            Err(Error::bounds(format!("shape {shape:?} has no axis {axis}")))
+            Err(Error::bounds(
+                "flip source cardinality does not match its shape".into(),
+            ))
         }
     }
 
-    pub fn source_offset(&self, offset: usize) -> usize {
+    pub(crate) fn source_offset(&self, offset: usize) -> usize {
         self.strides
             .iter()
             .copied()
@@ -1187,7 +1204,7 @@ impl FlipSpec {
                 offset
                     .checked_div(stride)
                     .map_or(0, |quotient| quotient % dim)
-            }) // coord
+            })
             .zip(self.strides.iter().copied())
             .enumerate()
             .map(|(x, (i, source_stride))| {
@@ -1196,36 +1213,98 @@ impl FlipSpec {
                 } else {
                     i
                 };
-
                 i * source_stride
             })
-            .sum::<usize>()
+            .sum()
     }
 }
 
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct ViewSpec {
-    pub shape: Shape,
-    pub strides: Strides,
-    pub source_strides: Strides,
+    shape: Shape,
+    strides: Strides,
+    source_strides: Strides,
+    source_size: usize,
+    size: usize,
 }
 
 impl ViewSpec {
-    pub fn new(shape: Shape, source_strides: Strides) -> Self {
-        let strides = strides_for(&shape, shape.len()).collect();
+    pub fn broadcast(source_shape: Shape, shape: Shape) -> Result<Self, Error> {
+        if shape.len() < source_shape.len()
+            || source_shape
+                .iter()
+                .rev()
+                .zip(shape.iter().rev())
+                .any(|(&source, &target)| source != target && source != 1)
+        {
+            return Err(Error::bounds(format!(
+                "cannot broadcast {source_shape:?} into {shape:?}"
+            )));
+        }
 
-        Self {
+        let source_size = checked_size(&source_shape)?;
+        let source_strides = strides_for(&source_shape, source_shape.len()).collect();
+        Self::new(shape, source_strides, source_size)
+    }
+
+    pub fn transpose(source_shape: Shape, permutation: Axes) -> Result<Self, Error> {
+        if permutation.len() != source_shape.len()
+            || permutation.iter().any(|&axis| axis >= source_shape.len())
+            || (1..permutation.len()).any(|i| permutation[i..].contains(&permutation[i - 1]))
+        {
+            return Err(Error::bounds(format!(
+                "invalid permutation for shape {source_shape:?}: {permutation:?}"
+            )));
+        }
+
+        let source_size = checked_size(&source_shape)?;
+        let strides: Strides = strides_for(&source_shape, source_shape.len()).collect();
+        let shape = permutation.iter().map(|&axis| source_shape[axis]).collect();
+        let source_strides = permutation.into_iter().map(|axis| strides[axis]).collect();
+        Self::new(shape, source_strides, source_size)
+    }
+
+    fn new(shape: Shape, source_strides: Strides, source_size: usize) -> Result<Self, Error> {
+        let size = checked_size(&shape)?;
+        let strides = strides_for(&shape, shape.len()).collect();
+        Ok(Self {
             shape,
             strides,
             source_strides,
+            source_size,
+            size,
+        })
+    }
+
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+
+    pub fn strides(&self) -> &Strides {
+        &self.strides
+    }
+
+    pub fn source_strides(&self) -> &Strides {
+        &self.source_strides
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn check_source(&self, size: usize) -> Result<(), Error> {
+        if size == self.source_size {
+            Ok(())
+        } else {
+            Err(Error::bounds(
+                "view source cardinality does not match its shape".into(),
+            ))
         }
     }
 
-    pub fn source_offset(&self, offset: usize) -> usize {
+    pub(crate) fn source_offset(&self, offset: usize) -> usize {
         debug_assert!(offset < self.size());
-
-        let source_offset = self
-            .strides
+        self.strides
             .iter()
             .copied()
             .zip(self.shape.iter().copied())
@@ -1235,16 +1314,10 @@ impl ViewSpec {
                 offset
                     .checked_div(stride)
                     .map_or(0, |quotient| quotient % dim)
-            }) // coord
+            })
             .zip(self.source_strides.iter().rev().copied())
             .map(|(i, source_stride)| i * source_stride)
-            .sum::<usize>();
-
-        source_offset
-    }
-
-    pub fn size(&self) -> usize {
-        self.shape.iter().product()
+            .sum()
     }
 }
 

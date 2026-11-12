@@ -1,24 +1,23 @@
 //! The host platform (i.e. the CPU and main memory)
 
-use crate::access::AccessBuf;
-
 pub use buffer::*;
 pub use platform::*;
 
+use crate::access::AccessBuf;
+
 mod buffer;
-pub mod ops;
+pub(crate) mod ops;
 mod platform;
 
 pub type ArrayBuf<T> = crate::array::Array<T, AccessBuf<Buffer<T>>, Host>;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::{
         shape, slice, AxisRange, Error, MatrixDual, NDArray, NDArrayCompare, NDArrayRead,
         NDArrayReduceBoolean, NDArrayTransform, NDArrayWrite, Shape,
     };
-
-    use super::*;
 
     #[test]
     fn test_matmul_large() -> Result<(), Error> {
@@ -57,14 +56,19 @@ mod tests {
     #[test]
     fn test_slice() -> Result<(), Error> {
         let array = ArrayBuf::new(vec![0; 6].into(), shape![2, 3])?;
-        let mut slice = array.slice(slice![AxisRange::In(0, 2, 1), AxisRange::At(1)])?;
+        let slice = array
+            .as_ref()
+            .slice(slice![AxisRange::In(0, 2, 1), AxisRange::At(1)])?;
 
         let zeros = ArrayBuf::new(vec![0, 0].into(), shape![2])?;
         let ones = ArrayBuf::new(vec![1, 1].into(), shape![2])?;
 
         assert!(slice.as_ref().eq(zeros)?.all()?);
 
-        slice.write(&ones)?;
+        let mut copy = slice.copy()?;
+        copy.write(&ones)?;
+        assert!(copy.eq(ones)?.all()?);
+        assert_eq!(&*array.buffer()?.to_slice()?, &[0; 6]);
 
         Ok(())
     }

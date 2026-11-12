@@ -11,6 +11,10 @@ impl<T: Number> BufferInstance<T> for Buffer<T> {
         BufferConverter::CL(self.into())
     }
 
+    fn into_buffer(self) -> Result<crate::Buffer<T>, Error> {
+        Ok(self.into())
+    }
+
     fn read_value(&self, offset: usize) -> Result<T, Error> {
         if offset < self.len() {
             let slice = self.map().offset(offset).len(1).read();
@@ -33,14 +37,13 @@ impl<T: Number> BufferInstance<T> for Buffer<T> {
 }
 
 impl<T: Number> BufferMut<T> for Buffer<T> {
-    fn cl(&mut self) -> Result<&mut Buffer<T>, Error> {
-        Ok(self)
-    }
-
     fn write<'a>(&mut self, data: BufferConverter<'a, T>) -> Result<(), Error> {
         if data.len() == Buffer::len(self) {
             let data = data.to_cl()?;
-            data.copy(self, None, None).enq().map_err(Error::from)
+            let queue = OpenCL::queue(self.len(), &[data.default_queue(), self.default_queue()])?;
+            data.cmd().queue(&queue).copy(self, None, None).enq()?;
+            self.set_default_queue(queue);
+            Ok(())
         } else {
             Err(Error::bounds(format!(
                 "cannot overwrite a buffer of size {} with one of size {}",
@@ -52,7 +55,7 @@ impl<T: Number> BufferMut<T> for Buffer<T> {
 
     fn write_value(&mut self, value: T) -> Result<(), Error> {
         let buf = Buffer::builder()
-            .context(OpenCL::context())
+            .queue(OpenCL::queue(Buffer::len(self), &[self.default_queue()])?)
             .len(Buffer::len(self))
             .fill_val(value)
             .build()?;
@@ -63,11 +66,15 @@ impl<T: Number> BufferMut<T> for Buffer<T> {
 
     fn write_value_at(&mut self, offset: usize, value: T) -> Result<(), Error> {
         if offset < Buffer::len(self) {
-            let slice = self.map().offset(offset).len(1).read();
-            // SAFETY: the safe wrapper validates the offset and keeps the mapped buffer
-            // alive.
-            let mut slice = unsafe { slice.enq()? };
-            slice.as_mut()[0] = value;
+            let queue = OpenCL::queue(self.len(), &[self.default_queue()])?;
+            let value = [value];
+            // The blocking write completes before the temporary host value is released.
+            self.cmd()
+                .queue(&queue)
+                .write(&value[..])
+                .offset(offset)
+                .enq()?;
+            self.set_default_queue(queue);
             Ok(())
         } else {
             Err(Error::bounds(format!(
@@ -107,10 +114,6 @@ impl<T: Number> BufferInstance<T> for &mut Buffer<T> {
 }
 
 impl<T: Number> BufferMut<T> for &mut Buffer<T> {
-    fn cl(&mut self) -> Result<&mut Buffer<T>, Error> {
-        Ok(*self)
-    }
-
     fn write<'b>(&mut self, data: BufferConverter<'b, T>) -> Result<(), Error> {
         BufferMut::write(&mut **self, data)
     }
@@ -139,7 +142,9 @@ impl<'a, T: Number> CLConverter<'a, T> {
         match self {
             Self::Owned(buffer) => Ok(buffer),
             Self::Borrowed(buffer) => {
-                let cl_queue = buffer.default_queue().expect("OpenCL queue");
+                let cl_queue = buffer.default_queue().ok_or_else(|| {
+                    Error::unsupported("OpenCL buffer has no default queue".to_string())
+                })?;
                 let copy = Buffer::builder()
                     .queue(cl_queue.clone())
                     .len(buffer.len())
