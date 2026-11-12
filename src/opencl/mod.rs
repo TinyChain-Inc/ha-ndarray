@@ -3,17 +3,16 @@
 use lazy_static::lazy_static;
 use ocl::OclPrm;
 
+use self::programs::{ElementDual, ElementUnary};
 use crate::access::{AccessBuf, AccessOp};
 use crate::host::VEC_MIN_SIZE;
 use crate::Float;
-
-use programs::{ElementDual, ElementUnary};
 
 pub use buffer::*;
 pub use platform::{OpenCL, ACC_MIN_SIZE, GPU_MIN_SIZE};
 
 mod buffer;
-pub mod ops;
+pub(crate) mod ops;
 mod platform;
 mod programs;
 
@@ -834,6 +833,7 @@ macro_rules! cl_complex {
             fn cl_abs() -> ElementUnary {
                 ElementUnary::new::<Self, $t, _>("_abs", "return hypot(n.x, n.y);")
             }
+
             // basic arithmetic (dual)
             fn cl_div() -> ElementDual {
                 ElementDual::new::<Self, Self, _>(
@@ -1245,8 +1245,8 @@ cl_trig_complex!(num_complex::Complex<f32>, f32);
 cl_trig_complex!(num_complex::Complex<f64>, f64);
 
 lazy_static! {
-    pub static ref CL_PLATFORM: platform::CLPlatform =
-        platform::CLPlatform::default().expect("OpenCL platform");
+    pub static ref CL_PLATFORM: Result<platform::CLPlatform, crate::Error> =
+        platform::CLPlatform::default();
 }
 
 pub type ArrayBuf<T> = crate::array::Array<T, AccessBuf<ocl::Buffer<T>>, OpenCL>;
@@ -1259,14 +1259,13 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[cfg(feature = "complex")]
     use crate::NDArrayTrig;
     use crate::{
         shape, slice, AxisRange, Error, MatrixDual, NDArray, NDArrayCompare, NDArrayMath,
         NDArrayRead, NDArrayReduceBoolean, NDArrayTransform, NDArrayWrite, Shape,
     };
-
-    use super::*;
 
     #[cfg(feature = "complex")]
     fn assert_complex32_close(
@@ -1323,11 +1322,11 @@ mod tests {
         let arr = ArrayBuf::new(buf, shape)?;
 
         let sin_expected = input.iter().map(|z| z.sin()).collect::<Vec<_>>();
-        let sin_actual = arr.clone().sin()?.buffer()?.to_slice()?.to_vec();
+        let sin_actual = arr.as_ref().sin()?.buffer()?.to_slice()?.to_vec();
         assert_complex32_close(&sin_actual, &sin_expected);
 
         let cos_expected = input.iter().map(|z| z.cos()).collect::<Vec<_>>();
-        let cos_actual = arr.clone().cos()?.buffer()?.to_slice()?.to_vec();
+        let cos_actual = arr.as_ref().cos()?.buffer()?.to_slice()?.to_vec();
         assert_complex32_close(&cos_actual, &cos_expected);
 
         let tan_expected = input.iter().map(|z| z.tan()).collect::<Vec<_>>();
@@ -1352,11 +1351,11 @@ mod tests {
         let arr = ArrayBuf::new(buf, shape)?;
 
         let sinh_expected = input.iter().map(|z| z.sinh()).collect::<Vec<_>>();
-        let sinh_actual = arr.clone().sinh()?.buffer()?.to_slice()?.to_vec();
+        let sinh_actual = arr.as_ref().sinh()?.buffer()?.to_slice()?.to_vec();
         assert_complex32_close(&sinh_actual, &sinh_expected);
 
         let cosh_expected = input.iter().map(|z| z.cosh()).collect::<Vec<_>>();
-        let cosh_actual = arr.clone().cosh()?.buffer()?.to_slice()?.to_vec();
+        let cosh_actual = arr.as_ref().cosh()?.buffer()?.to_slice()?.to_vec();
         assert_complex32_close(&cosh_actual, &cosh_expected);
 
         let tanh_expected = input.iter().map(|z| z.tanh()).collect::<Vec<_>>();
@@ -1381,11 +1380,11 @@ mod tests {
         let arr = ArrayBuf::new(buf, shape)?;
 
         let asin_expected = input.iter().map(|z| z.asin()).collect::<Vec<_>>();
-        let asin_actual = arr.clone().asin()?.buffer()?.to_slice()?.to_vec();
+        let asin_actual = arr.as_ref().asin()?.buffer()?.to_slice()?.to_vec();
         assert_complex32_close(&asin_actual, &asin_expected);
 
         let acos_expected = input.iter().map(|z| z.acos()).collect::<Vec<_>>();
-        let acos_actual = arr.clone().acos()?.buffer()?.to_slice()?.to_vec();
+        let acos_actual = arr.as_ref().acos()?.buffer()?.to_slice()?.to_vec();
         assert_complex32_close(&acos_actual, &acos_expected);
 
         let atan_expected = input.iter().map(|z| z.atan()).collect::<Vec<_>>();
@@ -1498,7 +1497,8 @@ mod tests {
         let buf = OpenCL::copy_into_buffer::<u32>(&[0; 6])?;
         let backing = buf.clone();
         let array = ArrayBuf::new(buf, shape![2, 3])?;
-        let mut slice = array.slice(slice![AxisRange::In(0, 2, 1), AxisRange::At(1)])?;
+        let slice = array.slice(slice![AxisRange::In(0, 2, 1), AxisRange::At(1)])?;
+        let mut slice = slice.copy()?;
 
         let buf = OpenCL::copy_into_buffer::<u32>(&[0, 0])?;
         let zeros = ArrayBuf::new(buf, shape![2])?;
@@ -1514,12 +1514,12 @@ mod tests {
         let mut values = vec![0; 6];
         backing.read(&mut values).enq()?;
 
-        assert_eq!(values, vec![0, 2, 0, 0, 2, 0]);
+        assert_eq!(values, vec![0; 6]);
         slice.write_value(3)?;
         slice.write_value(4)?;
         backing.read(&mut values).enq()?;
 
-        assert_eq!(values, vec![0, 4, 0, 0, 4, 0]);
+        assert_eq!(values, vec![0; 6]);
 
         Ok(())
     }

@@ -32,6 +32,21 @@ u8 conditions; unselected branches are not guaranteed to avoid evaluation or
 errors. Shapes/dtypes must match where required by the existing API; broadcasting
 and casting remain explicit.
 
+Shape `[]` is a one-element scalar, including in buffer/constant construction,
+all-axis indexing, and full-axis reductions with `keepdims = false`. Keeping
+reduced axes retains singleton dimensions. Selecting no reduction axes preserves
+the source shape. Shape `[0]` has no elements; existing empty-reduction restrictions
+remain in effect.
+
+Singleton reductions forward source values in buffered and point reads, including
+signed zeros and NaN classification. Multi-element reductions retain the
+reassociation and accuracy rules below.
+
+Broadcasting may prepend axes and expand singleton axes; it cannot reduce rank
+or shrink a non-singleton axis. Numeric axis reductions require a nonzero,
+representable reduced cardinality. Empty outputs from unreduced axes remain
+supported.
+
 ## Scalar rules
 
 Integer addition, subtraction, multiplication, absolute value, and nonnegative
@@ -76,9 +91,42 @@ A number is false exactly when it equals zero. Complex zero requires both
 components to be zero. NaN is truthy. Boolean operations and predicates return
 exactly u8 0 or 1. Complex is_nan/is_inf inspect either component independently.
 
+## Dynamic scalar differences
+
+number-general provides three explicit scalar surfaces. Ordinary floating/complex
+operations use IEEE/backend behavior; ordinary same-family integer operations
+follow the application's Rust overflow settings. Mixed signed/unsigned ordinary
+arithmetic checks its widened result in every profile. Its `try_*` methods reject
+overflow, underflow, invalid domains, and unrepresentable results.
+
+Checked scalar real functions use pinned software kernels and a certified subset
+of complex transcendentals; unsupported complex inputs reject before evaluation.
+See the [scalar numerical contract](https://github.com/TinyChain-Inc/number-general#numerical-contracts).
+This does not change array scheduling, native kernels or the array accuracy
+contract below. Native and checked scalar results may differ in their final bits.
+
+number-general's `wrapping_*` methods use the same dynamic promotion as its
+ordinary operations. Integer results wrap; floating/complex results retain native
+IEEE/backend behavior. Typed integer powers take full-width nonnegative exponents;
+dynamic negative or fractional powers can promote to floats. This scalar API does
+not require matching concrete dtypes.
+
+Integer division/remainder by zero panic in scalar wrapping methods, while arrays
+return zero. Checked scalar methods return errors. For nonzero integer divisors,
+scalar wrapping results agree with the rules above, including signed minimum
+wrapping under division by minus one. Array powers retain their dtype and their
+negative-power rules. The conformance fixtures retain independent backend oracles
+and assert deliberate scalar differences.
+
+Floating scalar rounding returns a floating value; integer conversion is explicit.
+Scalar/key equality canonicalizes NaNs, while array numerical predicates use IEEE
+unordered comparisons. Scalar `wrapping_sum`/`wrapping_product` consume left-to-right
+with promotion and do not promise bitwise agreement with reassociated array
+reductions.
+
 ## Cast compatibility
 
-Casts preserve number-general's CastFrom<Number> pipeline, not direct C casts:
+Casts preserve number-general's `CastFrom<Number>` pipeline, not direct C casts:
 
 - f32/Complex32 first convert the real component to i32/u32 for integer
   destinations; f64/Complex64 use i64/u64. This conversion truncates, saturates
@@ -110,13 +158,25 @@ for FFTs. These bounds do not apply for ku>=1 or intermediate range violations.
 Extreme-input aggregate classifications can differ with evaluation order.
 
 FFT/IFFT operate independently on each last-axis batch and are unnormalized:
-ifft(fft(x)) approximates N*x. Fourier point reads remain unsupported. This
-upgrade does not introduce empty-shape support to operations lacking it.
+ifft(fft(x)) approximates N*x. Fourier point reads remain unsupported. Scalar
+Fourier transforms remain unsupported because they have no transform axis.
 
 Uniform random constructors return f32 values in [0,1); normal constructors
-sample the standard normal distribution with finite Box-Muller inputs. Sequences
-need not match across backends or independent evaluations. Range constructors
-retain their existing step calculation and apply the scalar rules above.
+sample the standard normal distribution with finite Box-Muller inputs. Both
+constructors obtain host entropy through a fallible boundary, seed the existing
+PRNG, and return concrete buffers sampled once; repeated reads and point
+reads observe that sample. Sequences need not match across backends or separate
+constructor calls. Host zero-length random construction is supported; explicit
+OpenCL zero-length random construction rejects before backend work. Bare WASM
+without the `wasm` JavaScript-entropy feature rejects nonempty random construction
+with `Unsupported`; provider failures retain their typed cause. Seeding does not
+change the sampling calculations or numerical contract.
+
+Range constructors validate ordered endpoints and derive one linear step for
+both backends. Integer steps use widened span/cardinality arithmetic and
+truncating division. Floating endpoints must be finite; unrepresentable linear
+parameters reject before backend construction. Host empty and singleton ranges
+avoid division. Explicit OpenCL empty ranges return `Unsupported`.
 
 ## Backend requirements and compatibility
 
@@ -133,13 +193,6 @@ subnormals, infinities/NaNs, nearest rounding, and correctly rounded f32 divisio
 Unsupported paths report operation, dtype, device, and required capability.
 Compilation is device-specific. Relaxed-math/flush-to-zero options are disabled,
 and elementwise contraction is disabled.
-
-Compatibility changes include wide integer powers and zero remainders,
-scalar division by zero following the same dtype rules as array division,
-NaN-propagating min/max, complex predicates, OpenCL casts/unary operations,
-and inverse FFT dispatch. The previously unreadable complex re()/im() outputs
-now correctly declare the corresponding real dtype. Other ordinary signatures
-and persistent formats are unchanged.
 
 ## Conformance references and validation
 
@@ -172,18 +225,7 @@ Actual GPU conformance remains a mandatory pending gate: CPU OpenCL results do
 not establish GPU conformance. A future CubeCL implementation must satisfy the
 same contract and shared cases before being advertised as supported.
 
-Validation before the scheduling correction below used PoCL 6.0+debian (OpenCL 3.0, LLVM 18.1.8)
-on `cpu-skylake-avx512-AMD Ryzen 7 7840HS w/ Radeon 780M Graphics`, explicitly
-selected as a CPU device. The device name does not indicate GPU execution.
-
-| Validation | Debug | Release |
-|---|---:|---:|
-| Native host, complex enabled, all targets | 57 passed | 57 passed |
-| CPU-OpenCL, complex enabled, all targets | 91 passed | 91 passed |
-
-All-feature compilation, Clippy with warnings denied, doctests (no examples),
-formatting, and diff checks passed. Actual GPU execution has not been validated.
-
-The axis-reduction scheduler subsequently restored automatic workload-based
-selection. Backend conformance also checks explicit reduction adapters so small
-OpenCL cases remain device-executed even when the general scheduler chooses host.
+Backend conformance fixtures are private library tests under `tests/unit/`;
+public Array integration targets check supported application interfaces. See
+[CONTRIBUTING.md](https://github.com/TinyChain-Inc/ha-ndarray/blob/main/CONTRIBUTING.md#validation) for commands and environment
+requirements. WASM runtime checks are separate from native numerical conformance.

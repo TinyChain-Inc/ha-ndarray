@@ -1,6 +1,8 @@
 //! Internal reduction identities, without changing the public finite bounds.
-use crate::Real;
+
 use number_general::Number;
+
+use crate::Real;
 
 pub(crate) fn minimum<T: Real>() -> T {
     match T::ZERO.into() {

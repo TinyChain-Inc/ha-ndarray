@@ -1,9 +1,7 @@
-use super::Program;
 use memoize::memoize;
 
+use super::{build, Builder, ElementDual, Program, TILE_SIZE, WG_SIZE};
 use crate::Error;
-
-use super::{build, Builder, ElementDual, TILE_SIZE, WG_SIZE};
 
 #[memoize]
 pub fn diagonal(c_type: &'static str) -> Result<Program, Error> {

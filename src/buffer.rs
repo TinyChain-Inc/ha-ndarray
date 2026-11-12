@@ -13,6 +13,14 @@ pub trait BufferInstance<T: Number>: Send + Sync {
     /// Borrow this buffer as a [`BufferConverter`].
     fn read(&self) -> BufferConverter<'_, T>;
 
+    /// Consume this buffer, moving owned storage or copying borrowed storage.
+    fn into_buffer(self) -> Result<Buffer<T>, Error>
+    where
+        Self: Sized,
+    {
+        self.read().into_buffer()
+    }
+
     /// Read a single value in this buffer.
     fn read_value(&self, offset: usize) -> Result<T, Error>;
 
@@ -26,14 +34,6 @@ pub trait BufferInstance<T: Number>: Send + Sync {
 
 /// A mutable data buffer
 pub trait BufferMut<T: Number>: BufferInstance<T> + fmt::Debug {
-    #[cfg(feature = "opencl")]
-    /// Borrow this buffer as an [`ocl::Buffer`], or return an error if this not an OpenCL buffer.
-    fn cl(&mut self) -> Result<&mut ocl::Buffer<T>, Error> {
-        Err(Error::unsupported(format!(
-            "not an OpenCL buffer: {self:?}"
-        )))
-    }
-
     /// Overwrite this buffer.
     fn write<'a>(&mut self, data: BufferConverter<'a, T>) -> Result<(), Error>;
 
@@ -61,13 +61,21 @@ impl<T: Number> Buffer<T> {
 
 impl<T: Number> GetSize for Buffer<T> {
     fn get_size(&self) -> usize {
-        self.len() * std::mem::size_of::<T>()
+        match self {
+            Self::Host(buffer) => std::mem::size_of::<Self>() + buffer.get_heap_size(),
+            #[cfg(feature = "opencl")]
+            Self::CL(buffer) => buffer.len() * std::mem::size_of::<T>(),
+        }
     }
 }
 
 impl<T: Number> BufferInstance<T> for Buffer<T> {
     fn read(&self) -> BufferConverter<'_, T> {
         BufferConverter::from(self)
+    }
+
+    fn into_buffer(self) -> Result<Buffer<T>, Error> {
+        Ok(self)
     }
 
     fn read_value(&self, offset: usize) -> Result<T, Error> {
@@ -88,15 +96,6 @@ impl<T: Number> BufferInstance<T> for Buffer<T> {
 }
 
 impl<T: Number> BufferMut<T> for Buffer<T> {
-    #[cfg(feature = "opencl")]
-    fn cl(&mut self) -> Result<&mut ocl::Buffer<T>, Error> {
-        match self {
-            #[cfg(feature = "opencl")]
-            Self::CL(buf) => BufferMut::<T>::cl(buf),
-            Self::Host(buf) => buf.cl(),
-        }
-    }
-
     fn write<'a>(&mut self, data: BufferConverter<'a, T>) -> Result<(), Error> {
         match self {
             #[cfg(feature = "opencl")]
@@ -151,11 +150,6 @@ impl<T: Number> BufferInstance<T> for &mut Buffer<T> {
 }
 
 impl<T: Number> BufferMut<T> for &mut Buffer<T> {
-    #[cfg(feature = "opencl")]
-    fn cl(&mut self) -> Result<&mut ocl::Buffer<T>, Error> {
-        Buffer::<T>::cl(&mut **self)
-    }
-
     fn write<'b>(&mut self, data: BufferConverter<'b, T>) -> Result<(), Error> {
         Buffer::<T>::write(*self, data)
     }
@@ -170,7 +164,10 @@ impl<T: Number> BufferMut<T> for &mut Buffer<T> {
 }
 
 #[cfg(feature = "freqfs")]
-impl<FE: Send + Sync, T: Number> BufferInstance<T> for freqfs::FileReadGuardOwned<FE, Buffer<T>> {
+impl<FE, T: Number> BufferInstance<T> for freqfs::FileReadGuardOwned<FE, Buffer<T>>
+where
+    FE: safecast::AsType<Buffer<T>> + Send + Sync,
+{
     fn read(&self) -> BufferConverter<'_, T> {
         BufferInstance::read(&**self)
     }
@@ -185,7 +182,10 @@ impl<FE: Send + Sync, T: Number> BufferInstance<T> for freqfs::FileReadGuardOwne
 }
 
 #[cfg(feature = "freqfs")]
-impl<FE: Send + Sync, T: Number> BufferInstance<T> for freqfs::FileWriteGuardOwned<FE, Buffer<T>> {
+impl<FE, T: Number> BufferInstance<T> for freqfs::FileWriteGuardOwned<FE, Buffer<T>>
+where
+    FE: GetSize + safecast::AsType<Buffer<T>> + Send + Sync,
+{
     fn read(&self) -> BufferConverter<'_, T> {
         BufferInstance::read(&**self)
     }
@@ -200,12 +200,10 @@ impl<FE: Send + Sync, T: Number> BufferInstance<T> for freqfs::FileWriteGuardOwn
 }
 
 #[cfg(feature = "freqfs")]
-impl<FE: Send + Sync, T: Number> BufferMut<T> for freqfs::FileWriteGuardOwned<FE, Buffer<T>> {
-    #[cfg(feature = "opencl")]
-    fn cl(&mut self) -> Result<&mut ocl::Buffer<T>, Error> {
-        BufferMut::cl(&mut **self)
-    }
-
+impl<FE, T: Number> BufferMut<T> for freqfs::FileWriteGuardOwned<FE, Buffer<T>>
+where
+    FE: GetSize + safecast::AsType<Buffer<T>> + Send + Sync,
+{
     fn write<'a>(&mut self, data: BufferConverter<'a, T>) -> Result<(), Error> {
         BufferMut::write(&mut **self, data)
     }
@@ -277,7 +275,7 @@ impl<'a, T: Number> BufferConverter<'a, T> {
 
     #[cfg(feature = "opencl")]
     /// Ensure that this [`Buffer`] is in OpenCL memory by making a copy if necessary.
-    pub fn to_cl(self) -> Result<opencl::CLConverter<'a, T>, ocl::Error> {
+    pub fn to_cl(self) -> Result<opencl::CLConverter<'a, T>, Error> {
         match self {
             Self::CL(buffer) => Ok(buffer),
             Self::Host(buffer) => {

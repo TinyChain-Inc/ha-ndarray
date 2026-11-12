@@ -79,7 +79,7 @@ where
     }
 }
 
-/// Shift the primary frequency component to the center of the given axis, or invert a shift.
+/// Move the zero-frequency component to the center of the selected axis (FFT shift).
 pub fn shift<'a, T, X>(
     data: ArrayAccess<'a, T>,
     axis: X,
@@ -88,11 +88,14 @@ where
     T: Number,
     X: Into<Option<usize>>,
 {
-    let axis = axis.into().unwrap_or_else(|| data.ndim() - 1);
+    let axis = axis
+        .into()
+        .or_else(|| data.ndim().checked_sub(1))
+        .ok_or_else(|| Error::bounds("FFT shift requires an axis".into()))?;
 
     if axis < data.ndim() {
         let dim = data.shape()[axis];
-        let pivot = dim / 2 + 1;
+        let pivot = dim.div_ceil(2);
 
         let range = slice_range(data.shape(), axis, 0..pivot);
         let left = data.clone().slice(range)?;
@@ -100,7 +103,7 @@ where
         let range = slice_range(data.shape(), axis, pivot..dim);
         let right = data.clone().slice(range)?;
 
-        Array::transpose_concat(vec![left, right], axis)
+        Array::transpose_concat(vec![right, left], axis)
     } else {
         Err(Error::bounds(format!("{data:?} has no axis {axis}")))
     }

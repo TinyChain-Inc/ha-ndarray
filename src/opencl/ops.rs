@@ -1,20 +1,15 @@
-use std::borrow::BorrowMut;
-use std::fmt;
 use std::marker::PhantomData;
 
-use frand::Rand;
 use number_general as ng;
 use ocl::{Buffer, Kernel, Queue};
 
 use super::platform::OpenCL;
 use super::programs::Program;
 use super::{programs, CLElement, TILE_SIZE, WG_SIZE};
-use crate::access::{Access, AccessMut};
+use crate::access::Access;
 use crate::opencl::programs::{ElementDual, ElementUnary};
-use crate::ops::{Concat, Enqueue, FlipSpec, Op, ReadValue, SliceSpec, ViewSpec, Write};
-use crate::{
-    strides_for, Axes, BufferConverter, Error, Float, Number, Platform, Range, Real, Shape, Strides,
-};
+use crate::ops::{Concat, Enqueue, FlipSpec, Op, ReadValue, SliceSpec, ViewSpec};
+use crate::{Error, Float, Number, Platform, Real};
 
 pub struct Cast<A, IT, OT> {
     access: A,
@@ -436,11 +431,10 @@ pub struct Flip<A, T> {
     dtype: PhantomData<T>,
 }
 
-impl<A, T: Number> Flip<A, T> {
-    pub fn new(access: A, shape: Shape, axis: usize) -> Result<Self, Error> {
-        let spec = FlipSpec::new(shape, axis)?;
+impl<A: Access<T>, T: Number> Flip<A, T> {
+    pub fn new(access: A, spec: FlipSpec) -> Result<Self, Error> {
+        spec.check_source(access.size())?;
         let program = programs::view::flip(T::TYPE, spec.clone())?;
-
         Ok(Self {
             access,
             spec,
@@ -581,12 +575,15 @@ where
     T: Number,
 {
     pub fn new(left: L, right: R, dims: [usize; 4]) -> Result<Self, Error> {
-        let pad_matrices = programs::linalg::pad_matrices(T::TYPE)?;
-        let matmul = programs::linalg::matmul(T::cl_mul(), T::cl_add())?;
+        if dims.contains(&0) {
+            return Err(Error::Unsupported(
+                "empty OpenCL matrix multiplication is unsupported".into(),
+            ));
+        }
 
         let [batch_size, a, b, c] = dims;
-
-        assert!(batch_size > 0);
+        let pad_matrices = programs::linalg::pad_matrices(T::TYPE)?;
+        let matmul = programs::linalg::matmul(T::cl_mul(), T::cl_add())?;
 
         let dims = [a, b, c];
 
@@ -826,120 +823,75 @@ impl<T: Number> ReadValue<OpenCL, T> for Linear<T> {
     }
 }
 
-pub struct RandomNormal {
-    program: Program,
-    size: usize,
-}
-
-impl RandomNormal {
-    pub fn new(size: usize) -> Result<Self, Error> {
-        programs::constructors::random_normal().map(|program| Self { program, size })
+pub fn random_normal(size: usize) -> Result<Buffer<f32>, Error> {
+    if size == 0 {
+        return Err(Error::unsupported(
+            "empty OpenCL random construction".into(),
+        ));
     }
-}
+    let padded_size = WG_SIZE
+        .checked_mul(size.div_ceil(WG_SIZE))
+        .ok_or_else(|| Error::bounds("random normal cardinality overflow".into()))?;
+    let program = programs::constructors::random_normal()?;
+    let queue = OpenCL::queue(size, &[])?;
+    let program = program.for_queue(&queue)?;
+    let seed: u32 = crate::random::rng()?.gen();
 
-impl Op for RandomNormal {
-    fn size(&self) -> usize {
-        self.size
-    }
-}
+    let buffer = Buffer::builder()
+        .queue(queue.clone())
+        .len(padded_size)
+        .build()?;
 
-impl Enqueue<OpenCL, f32> for RandomNormal {
-    type Buffer = Buffer<f32>;
+    let kernel = Kernel::builder()
+        .name("random_normal")
+        .queue(queue.clone())
+        .program(&program)
+        .global_work_size(buffer.len())
+        .local_work_size(WG_SIZE)
+        .arg(u64::from(seed))
+        .arg(&buffer)
+        .arg_local::<f32>(WG_SIZE)
+        .build()?;
 
-    fn enqueue(&self) -> Result<Self::Buffer, Error> {
-        let queue = OpenCL::queue(self.size, &[])?;
-        let seed: u32 = Rand::new().gen();
+    // SAFETY: kernel arguments and dimensions are validated, and all referenced
+    // buffers outlive this enqueue.
+    unsafe { kernel.enq()? }
 
-        let buffer = Buffer::builder()
-            .queue(queue.clone())
-            .len(WG_SIZE * self.size().div_ceil(WG_SIZE))
-            .build()?;
-
-        let kernel = Kernel::builder()
-            .name("random_normal")
-            .queue(queue.clone())
-            .program(&self.program.for_queue(&queue)?)
-            .global_work_size(buffer.len())
-            .local_work_size(WG_SIZE)
-            .arg(u64::from(seed))
-            .arg(&buffer)
-            .arg_local::<f32>(WG_SIZE)
-            .build()?;
-
-        // SAFETY: kernel arguments and dimensions are validated, and all referenced
-        // buffers outlive this enqueue.
-        unsafe { kernel.enq()? }
-
-        if buffer.len() == self.size {
-            Ok(buffer)
-        } else {
-            let output = Buffer::builder().queue(queue).len(self.size).build()?;
-
-            buffer.copy(&output, Some(0), Some(self.size)).enq()?;
-
-            Ok(output)
-        }
-    }
-}
-
-impl ReadValue<OpenCL, f32> for RandomNormal {
-    fn read_value(&self, _offset: usize) -> Result<f32, Error> {
-        Err(Error::bounds(
-            "cannot read an individual value from a random normal distribution".to_string(),
-        ))
-    }
-}
-
-pub struct RandomUniform {
-    program: Program,
-    size: usize,
-}
-
-impl RandomUniform {
-    pub fn new(size: usize) -> Result<Self, Error> {
-        programs::constructors::random_uniform().map(|program| Self { program, size })
-    }
-}
-
-impl Op for RandomUniform {
-    fn size(&self) -> usize {
-        self.size
-    }
-}
-
-impl Enqueue<OpenCL, f32> for RandomUniform {
-    type Buffer = Buffer<f32>;
-
-    fn enqueue(&self) -> Result<Self::Buffer, Error> {
-        let queue = OpenCL::queue(self.size, &[])?;
-        let seed: u32 = Rand::new().gen();
-
-        let output = Buffer::builder()
-            .queue(queue.clone())
-            .len(self.size)
-            .build()?;
-
-        let kernel = Kernel::builder()
-            .name("random_uniform")
-            .program(&self.program.for_queue(&queue)?)
-            .queue(queue)
-            .global_work_size(output.len())
-            .arg(seed as u64)
-            .arg(&output)
-            .build()?;
-
-        // SAFETY: kernel arguments and dimensions are validated, and all referenced
-        // buffers outlive this enqueue.
-        unsafe { kernel.enq()? }
-
+    if buffer.len() == size {
+        Ok(buffer)
+    } else {
+        let output = Buffer::builder().queue(queue).len(size).build()?;
+        buffer.copy(&output, Some(0), Some(size)).enq()?;
         Ok(output)
     }
 }
 
-impl ReadValue<OpenCL, f32> for RandomUniform {
-    fn read_value(&self, _offset: usize) -> Result<f32, Error> {
-        Ok(Rand::new().gen())
+pub fn random_uniform(size: usize) -> Result<Buffer<f32>, Error> {
+    if size == 0 {
+        return Err(Error::unsupported(
+            "empty OpenCL random construction".into(),
+        ));
     }
+    let program = programs::constructors::random_uniform()?;
+    let queue = OpenCL::queue(size, &[])?;
+    let program = program.for_queue(&queue)?;
+    let seed: u32 = crate::random::rng()?.gen();
+
+    let output = Buffer::builder().queue(queue.clone()).len(size).build()?;
+    let kernel = Kernel::builder()
+        .name("random_uniform")
+        .program(&program)
+        .queue(queue)
+        .global_work_size(output.len())
+        .arg(seed as u64)
+        .arg(&output)
+        .build()?;
+
+    // SAFETY: kernel arguments and dimensions are validated, and all referenced
+    // buffers outlive this enqueue.
+    unsafe { kernel.enq()? }
+
+    Ok(output)
 }
 
 pub struct Reduce<A, T: Number> {
@@ -1067,6 +1019,9 @@ impl<A: Access<T>, T: Number> Enqueue<OpenCL, T> for Reduce<A, T> {
 
     fn enqueue(&self) -> Result<Self::Buffer, Error> {
         let input = self.access.read()?.to_cl()?;
+        if self.stride == 1 {
+            return input.into_buffer();
+        }
 
         let queue = OpenCL::queue(input.len(), &[input.default_queue()])?;
 
@@ -1104,6 +1059,10 @@ impl<A: Access<T>, T: Number> ReadValue<OpenCL, T> for Reduce<A, T> {
     fn read_value(&self, offset: usize) -> Result<T, Error> {
         if offset >= self.size() {
             return Err(Error::bounds(format!("invalid reduction offset {offset}")));
+        }
+
+        if self.stride == 1 {
+            return self.access.read_value(offset);
         }
 
         let output = self.enqueue()?;
@@ -1349,14 +1308,12 @@ pub struct Slice<A, T> {
     access: A,
     spec: SliceSpec,
     read: Program,
-    write: Option<Program>,
-    write_value: Option<Program>,
     dtype: PhantomData<T>,
 }
 
-impl<A, T: Number> Slice<A, T> {
-    pub fn new(access: A, shape: &[usize], range: Range) -> Result<Self, Error> {
-        let spec = SliceSpec::new(shape, range);
+impl<A: Access<T>, T: Number> Slice<A, T> {
+    pub fn new(access: A, spec: SliceSpec) -> Result<Self, Error> {
+        spec.check_source(access.size())?;
 
         let read = programs::slice::read_slice(T::TYPE, spec.clone())?;
 
@@ -1364,8 +1321,6 @@ impl<A, T: Number> Slice<A, T> {
             access,
             spec,
             read,
-            write: None,
-            write_value: None,
             dtype: PhantomData,
         })
     }
@@ -1409,87 +1364,6 @@ impl<A: Access<T>, T: Number> Enqueue<OpenCL, T> for Slice<A, T> {
 impl<A: Access<T>, T: Number> ReadValue<OpenCL, T> for Slice<A, T> {
     fn read_value(&self, offset: usize) -> Result<T, Error> {
         self.access.read_value(self.spec.source_offset(offset))
-    }
-}
-
-impl<A, T> Write<OpenCL, T> for Slice<A, T>
-where
-    T: Number,
-    A: AccessMut<T> + fmt::Debug,
-{
-    fn write<'a>(&mut self, data: BufferConverter<'a, T>) -> Result<(), Error> {
-        let data = data.to_cl()?;
-        let size_hint = self.size();
-        let source = self.access.cl_buffer()?;
-
-        let queue = OpenCL::queue(size_hint, &[data.default_queue(), source.default_queue()])?;
-
-        if self.write.is_none() {
-            let program = programs::slice::write_to_slice(T::TYPE, self.spec.clone())?;
-            self.write = Some(program);
-        }
-
-        let kernel = Kernel::builder()
-            .name("write_slice")
-            .program(
-                &self
-                    .write
-                    .as_ref()
-                    .expect("CL write op")
-                    .for_queue(&queue)?,
-            )
-            .queue(queue.clone())
-            .global_work_size(size_hint)
-            .arg(&*source)
-            .arg(&*data)
-            .build()?;
-
-        // SAFETY: kernel arguments and dimensions are validated, and all referenced
-        // buffers outlive this enqueue.
-        unsafe { kernel.enq()? }
-        source.set_default_queue(queue);
-
-        Ok(())
-    }
-
-    fn write_value(&mut self, value: T) -> Result<(), Error> {
-        let size_hint = self.size();
-        let source = self.access.cl_buffer()?;
-
-        let queue = OpenCL::queue(size_hint, &[source.default_queue()])?;
-
-        if self.write_value.is_none() {
-            let program = programs::slice::write_value_to_slice(T::TYPE, self.spec.clone())?;
-            self.write_value = Some(program);
-        }
-
-        let kernel = Kernel::builder()
-            .name("write_slice_value")
-            .program(
-                &self
-                    .write_value
-                    .as_ref()
-                    .expect("CL write op")
-                    .for_queue(&queue)?,
-            )
-            .queue(queue.clone())
-            .global_work_size(size_hint)
-            .arg(&*source)
-            .arg(value)
-            .build()?;
-
-        // SAFETY: kernel arguments and dimensions are validated, and all referenced
-        // buffers outlive this enqueue.
-        unsafe { kernel.enq()? }
-        source.set_default_queue(queue);
-
-        Ok(())
-    }
-
-    fn write_value_at(&mut self, offset: usize, value: T) -> Result<(), Error> {
-        self.access
-            .borrow_mut()
-            .write_value_at(self.spec.source_offset(offset), value)
     }
 }
 
@@ -1671,14 +1545,11 @@ pub struct View<A, T> {
     dtype: PhantomData<T>,
 }
 
-impl<A, T> View<A, T>
-where
-    T: Number,
-{
-    fn new(access: A, spec: ViewSpec) -> Result<Self, Error> {
-        let size = spec.shape.iter().product();
+impl<A: Access<T>, T: Number> View<A, T> {
+    pub fn new(access: A, spec: ViewSpec) -> Result<Self, Error> {
+        spec.check_source(access.size())?;
+        let size = spec.size();
         let program = programs::view::view(T::TYPE, spec.clone())?;
-
         Ok(Self {
             access,
             program,
@@ -1686,20 +1557,6 @@ where
             spec,
             dtype: PhantomData,
         })
-    }
-
-    pub fn broadcast(access: A, shape: Shape, broadcast: Shape) -> Result<Self, Error> {
-        let strides = strides_for(&shape, shape.len()).collect();
-        let spec = ViewSpec::new(broadcast, strides);
-        Self::new(access, spec)
-    }
-
-    pub fn transpose(access: A, shape: Shape, axes: Axes) -> Result<Self, Error> {
-        let strides = strides_for(&shape, shape.len()).collect::<Strides>();
-        let shape = axes.iter().copied().map(|x| shape[x]).collect::<Shape>();
-        let strides = axes.into_iter().map(|x| strides[x]).collect::<Strides>();
-        let spec = ViewSpec::new(shape, strides);
-        Self::new(access, spec)
     }
 }
 

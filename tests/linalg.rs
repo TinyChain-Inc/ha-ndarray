@@ -5,6 +5,15 @@ fn test_diag() -> Result<(), Error> {
     let x = ArrayOp::range(0, 9, shape![3, 3])?;
     let diag = x.diag()?;
     assert_eq!(&*diag.buffer()?.to_slice()?, &[0, 4, 8]);
+    for dims in [shape![0, 0], shape![3, 0, 0], shape![0, 3, 3]] {
+        let x = ArrayBuf::new(Vec::<i32>::new(), dims.clone())?;
+        let diag = x.diag()?;
+        assert_eq!(diag.shape(), &dims[..dims.len() - 1]);
+        assert!(diag.buffer()?.is_empty());
+    }
+    let x = ArrayBuf::new(Vec::<i32>::new(), shape![0, usize::MAX, 2, 0, 0])?;
+    assert!(matches!(x.diag(), Err(Error::Bounds(_))));
+
     Ok(())
 }
 
@@ -27,6 +36,24 @@ fn test_matmul_12x20() -> Result<(), Error> {
     let eq = actual.eq(expected)?;
     assert!(eq.all()?);
 
+    let empty_products: [(Shape, Shape, Shape); 3] = [
+        (shape![0, 3], shape![3, 2], shape![0, 2]),
+        (shape![2, 3], shape![3, 0], shape![2, 0]),
+        (shape![0, 2, 3], shape![0, 3, 4], shape![0, 2, 4]),
+    ];
+    for (left, right, expected) in empty_products {
+        let l = ArrayBuf::new(vec![1i32; left.iter().product()], left)?;
+        let r = ArrayBuf::new(vec![1i32; right.iter().product()], right)?;
+        let product = l.matmul(r)?;
+        assert_eq!(product.shape(), &expected[..]);
+        assert!(product.buffer()?.is_empty());
+    }
+    let l = ArrayBuf::new(Vec::<i32>::new(), shape![2, 0])?;
+    let r = ArrayBuf::new(Vec::<i32>::new(), shape![0, 3])?;
+    let product = l.matmul(r)?;
+    assert_eq!(product.shape(), &[2, 3]);
+    assert_eq!(&*product.buffer()?.to_slice()?, &[0; 6]);
+
     Ok(())
 }
 
@@ -35,7 +62,7 @@ fn test_dot_product() -> Result<(), Error> {
     let buffer = (0..16).collect::<Vec<_>>();
     let vectors = ArrayBuf::<i32, Buffer<i32>>::new(buffer.to_vec().into(), shape![4, 1, 4])?;
 
-    let l: ArrayBuf<i32, &Buffer<i32>> = vectors.as_ref();
+    let l: Array<i32, &AccessBuf<Buffer<i32>>> = vectors.as_ref();
     let r = l.clone().mt()?;
 
     let actual = l.matmul(r)?.buffer()?.to_slice()?.to_vec();
@@ -46,6 +73,14 @@ fn test_dot_product() -> Result<(), Error> {
     }
 
     assert_eq!(actual, expected);
+
+    let dims = shape![0, usize::MAX, 2, 0, 0];
+    let l = ArrayBuf::new(Vec::<i32>::new(), dims.clone())?;
+    let r = ArrayBuf::new(Vec::<i32>::new(), dims)?;
+    assert!(matches!(l.matmul(r), Err(Error::Bounds(_))));
+    let l = ArrayBuf::new(Vec::<i32>::new(), shape![usize::MAX, 0])?;
+    let r = ArrayBuf::new(Vec::<i32>::new(), shape![0, 2])?;
+    assert!(matches!(l.matmul(r), Err(Error::Bounds(_))));
 
     Ok(())
 }

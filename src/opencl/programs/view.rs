@@ -1,24 +1,22 @@
-use super::Program;
 use memoize::memoize;
 
+use super::{build, ArrayFormat, Program};
 use crate::ops::{FlipSpec, ViewSpec};
 use crate::Error;
 
-use super::{build, ArrayFormat};
-
 #[memoize(Capacity: 1024)]
 pub fn flip(c_type: &'static str, spec: FlipSpec) -> Result<Program, Error> {
-    let axis = spec.axis;
-    let ndim = spec.shape.len();
-    let shape = ArrayFormat::from(spec.shape.as_slice());
-    let strides = ArrayFormat::from(spec.strides.as_slice());
+    let axis = spec.axis();
+    let ndim = spec.shape().len();
+    let shape = ArrayFormat::from(spec.shape().as_slice());
+    let strides = ArrayFormat::from(spec.strides().as_slice());
 
     let src = format!(
         r#"
         const uint ndim = {ndim};
 
-        const ulong strides[{ndim}] = {strides};
-        const ulong dims[{ndim}] = {shape};
+        const ulong strides[{ndim_slots}] = {strides};
+        const ulong dims[{ndim_slots}] = {shape};
 
         __kernel void flip(
                 __global const {c_type}* restrict input,
@@ -29,9 +27,9 @@ pub fn flip(c_type: &'static str, spec: FlipSpec) -> Result<Program, Error> {
 
             #pragma unroll
             for (uint x = 0; x < {ndim}; x++) {{
-                uint stride = strides[x];
+                ulong stride = strides[x];
 
-                uint i;
+                ulong i;
                 if (stride == 0) {{
                     i = 0;
                 }} else {{
@@ -48,6 +46,7 @@ pub fn flip(c_type: &'static str, spec: FlipSpec) -> Result<Program, Error> {
             output[offset_out] = input[offset_in];
         }}
         "#,
+        ndim_slots = ndim.max(1),
     );
 
     build(&src, &[c_type], "view")
@@ -56,21 +55,21 @@ pub fn flip(c_type: &'static str, spec: FlipSpec) -> Result<Program, Error> {
 // TODO: support SharedCache
 #[memoize(Capacity: 1024)]
 pub fn view(c_type: &'static str, spec: ViewSpec) -> Result<Program, Error> {
-    let ndim_in = spec.source_strides.len();
-    let ndim_out = spec.shape.len();
+    let ndim_in = spec.source_strides().len();
+    let ndim_out = spec.shape().len();
 
-    let strides_in = ArrayFormat::from(spec.source_strides.as_slice());
-    let strides_out = ArrayFormat::from(spec.strides.as_slice());
-    let dims_out = ArrayFormat::from(spec.shape.as_slice());
+    let strides_in = ArrayFormat::from(spec.source_strides().as_slice());
+    let strides_out = ArrayFormat::from(spec.strides().as_slice());
+    let dims_out = ArrayFormat::from(spec.shape().as_slice());
 
     let src = format!(
         r#"
         const uint ndim_in = {ndim_in};
         const uint ndim_out = {ndim_out};
 
-        const ulong strides_in[{ndim_in}] = {strides_in};
-        const ulong strides_out[{ndim_out}] = {strides_out};
-        const ulong dims[{ndim_out}] = {dims_out};
+        const ulong strides_in[{input_slots}] = {strides_in};
+        const ulong strides_out[{output_slots}] = {strides_out};
+        const ulong dims[{output_slots}] = {dims_out};
 
         __kernel void view(
                 __global const {c_type}* restrict input,
@@ -82,9 +81,9 @@ pub fn view(c_type: &'static str, spec: ViewSpec) -> Result<Program, Error> {
             #pragma unroll
             for (uint x_in = 0; x_in < {ndim_in}; x_in++) {{
                 uint x_out = {ndim_offset} + x_in;
-                uint stride_out = strides_out[x_out];
+                ulong stride_out = strides_out[x_out];
 
-                uint i;
+                ulong i;
                 if (stride_out == 0) {{
                     i = 0;
                 }} else {{
@@ -97,7 +96,9 @@ pub fn view(c_type: &'static str, spec: ViewSpec) -> Result<Program, Error> {
             output[offset_out] = input[offset_in];
         }}
         "#,
-        ndim_offset = (ndim_out - ndim_in)
+        ndim_offset = (ndim_out - ndim_in),
+        input_slots = ndim_in.max(1),
+        output_slots = ndim_out.max(1)
     );
 
     build(&src, &[c_type], "view")

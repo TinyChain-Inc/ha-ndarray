@@ -1,7 +1,7 @@
-use number_general as ng;
 use rayon::prelude::*;
-use safecast::CastInto;
 
+use super::buffer::Buffer;
+use super::ops::*;
 use crate::access::{Access, AccessOp};
 use crate::buffer::BufferConverter;
 use crate::host::StackVec;
@@ -13,10 +13,7 @@ use crate::ops::{
     Transform,
 };
 use crate::platform::{Convert, PlatformInstance};
-use crate::{stackvec, Axes, Constant, Error, Float, Number, Range, Real, Shape};
-
-use super::buffer::Buffer;
-use super::ops::*;
+use crate::{stackvec, Constant, Error, Float, Number, Real};
 
 pub const VEC_MIN_SIZE: usize = 64;
 
@@ -71,7 +68,13 @@ where
         access
             .read()
             .and_then(|buf| buf.to_slice())
-            .map(|slice| slice.iter().copied().reduce(T::max).expect("max"))
+            .and_then(|slice| {
+                slice
+                    .iter()
+                    .copied()
+                    .reduce(T::max)
+                    .ok_or_else(|| Error::bounds("cannot max an empty buffer".to_string()))
+            })
     }
 
     fn min(self, access: A) -> Result<T, Error>
@@ -81,21 +84,39 @@ where
         access
             .read()
             .and_then(|buf| buf.to_slice())
-            .map(|slice| slice.iter().copied().reduce(T::min).expect("min"))
+            .and_then(|slice| {
+                slice
+                    .iter()
+                    .copied()
+                    .reduce(T::min)
+                    .ok_or_else(|| Error::bounds("cannot min an empty buffer".to_string()))
+            })
     }
 
     fn product(self, access: A) -> Result<T, Error> {
         access
             .read()
             .and_then(|buf| buf.to_slice())
-            .map(|slice| slice.iter().copied().reduce(T::mul).expect("product"))
+            .and_then(|slice| {
+                slice
+                    .iter()
+                    .copied()
+                    .reduce(T::mul)
+                    .ok_or_else(|| Error::bounds("cannot product an empty buffer".to_string()))
+            })
     }
 
     fn sum(self, access: A) -> Result<T, Error> {
         access
             .read()
             .and_then(|buf| buf.to_slice())
-            .map(|slice| slice.iter().copied().reduce(T::add).expect("sum"))
+            .and_then(|slice| {
+                slice
+                    .iter()
+                    .copied()
+                    .reduce(T::add)
+                    .ok_or_else(|| Error::bounds("cannot sum an empty buffer".to_string()))
+            })
     }
 }
 
@@ -248,13 +269,8 @@ impl<T: Number + PartialOrd> ConstructRange<T> for Host {
     type Range = Linear<T>;
 
     fn range(self, start: T, stop: T, size: usize) -> Result<AccessOp<Self::Range, Self>, Error> {
-        if start <= stop {
-            let size_t = ng::Number::from(size as u64).cast_into();
-            let step = T::div(T::sub(stop, start), size_t);
-            Ok(Linear::new(start, step, size).into())
-        } else {
-            Err(Error::bounds(format!("invalid range: [{start}, {stop})")))
-        }
+        let step = crate::ops::range_step(start, stop, size)?;
+        Ok(Linear::new(start, step, size).into())
     }
 }
 
@@ -613,14 +629,14 @@ where
     T: rustfft::FftNum,
     num_complex::Complex<T>: crate::Complex,
 {
-    type Op = complex::FFT<A, num_complex::Complex<T>>;
+    type Op = complex::Fft<A, num_complex::Complex<T>>;
 
     fn fft(self, access: A, dim: usize) -> Result<AccessOp<Self::Op, Self>, Error> {
-        complex::FFT::fft(access, dim).map(AccessOp::from)
+        complex::Fft::fft(access, dim).map(AccessOp::from)
     }
 
     fn ifft(self, access: A, dim: usize) -> Result<AccessOp<Self::Op, Self>, Error> {
-        complex::FFT::ifft(access, dim).map(AccessOp::from)
+        complex::Fft::ifft(access, dim).map(AccessOp::from)
     }
 }
 
@@ -656,15 +672,12 @@ impl<A: Access<T>, T: Number> LinAlgUnary<A, T> for Host {
 }
 
 impl Random for Host {
-    type Normal = RandomNormal;
-    type Uniform = RandomUniform;
-
-    fn random_normal(self, size: usize) -> Result<AccessOp<Self::Normal, Self>, Error> {
-        Ok(RandomNormal::new(size).into())
+    fn random_normal(self, size: usize) -> Result<Self::Buffer, Error> {
+        super::ops::random_normal(size)
     }
 
-    fn random_uniform(self, size: usize) -> Result<AccessOp<Self::Uniform, Self>, Error> {
-        Ok(RandomUniform::new(size).into())
+    fn random_uniform(self, size: usize) -> Result<Self::Buffer, Error> {
+        super::ops::random_uniform(size)
     }
 }
 
@@ -744,49 +757,32 @@ impl<A: Access<T>, T: Number> ReduceAxes<A, T> for Host {
     }
 }
 
-impl<A, T> Transform<A, T> for Host
-where
-    A: Access<T>,
-    T: Number,
-{
-    type Broadcast = View<A, T>;
+impl<A: Access<T>, T: Number> Transform<A, T> for Host {
+    type View = View<A, T>;
     type Flip = Flip<A, T>;
     type Slice = Slice<A, T>;
-    type Transpose = View<A, T>;
 
-    fn broadcast(
+    fn view(
         self,
         access: A,
-        shape: Shape,
-        broadcast: Shape,
-    ) -> Result<AccessOp<Self::Broadcast, Self>, Error> {
-        Ok(View::broadcast(access, shape, broadcast).into())
+        spec: crate::ops::ViewSpec,
+    ) -> Result<AccessOp<Self::View, Self>, Error> {
+        View::new(access, spec).map(AccessOp::from)
     }
 
     fn flip(
         self,
         access: A,
-        shape: Shape,
-        axis: usize,
+        spec: crate::ops::FlipSpec,
     ) -> Result<AccessOp<Self::Flip, Self>, Error> {
-        Flip::new(access, shape, axis).map(AccessOp::from)
+        Flip::new(access, spec).map(AccessOp::from)
     }
 
     fn slice(
         self,
         access: A,
-        shape: &[usize],
-        range: Range,
+        spec: crate::ops::SliceSpec,
     ) -> Result<AccessOp<Self::Slice, Self>, Error> {
-        Ok(Slice::new(access, shape, range).into())
-    }
-
-    fn transpose(
-        self,
-        access: A,
-        shape: Shape,
-        permutation: Axes,
-    ) -> Result<AccessOp<Self::Transpose, Self>, Error> {
-        Ok(View::transpose(access, shape, permutation).into())
+        Slice::new(access, spec).map(AccessOp::from)
     }
 }

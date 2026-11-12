@@ -2,23 +2,18 @@ use std::f32::consts::PI;
 use std::iter;
 use std::marker::PhantomData;
 
-use frand::Rand;
 use number_general as ng;
 use rayon::join;
 use rayon::prelude::*;
 
+use super::buffer::Buffer;
+use super::platform::{Heap, Host, Stack};
+use super::{SliceConverter, StackVec, VEC_MIN_SIZE};
 use crate::access::Access;
 use crate::ops::{Concat, Enqueue, FlipSpec, Op, ReadValue, SliceSpec, ViewSpec};
 #[cfg(feature = "complex")]
 use crate::Complex;
-use crate::{
-    strides_for, AccessMut, Axes, BufferConverter, Error, Float, Number, Platform, Range, Real,
-    Shape, Strides,
-};
-
-use super::buffer::Buffer;
-use super::platform::{Heap, Host, Stack};
-use super::{SliceConverter, StackVec, VEC_MIN_SIZE};
+use crate::{Error, Float, Number, Platform, Real};
 
 #[cfg(feature = "complex")]
 pub mod complex;
@@ -508,9 +503,10 @@ pub struct Flip<A, T> {
     dtype: PhantomData<T>,
 }
 
-impl<A, T> Flip<A, T> {
-    pub fn new(access: A, shape: Shape, axis: usize) -> Result<Self, Error> {
-        FlipSpec::new(shape, axis).map(|spec| Self {
+impl<A: Access<T>, T: Number> Flip<A, T> {
+    pub fn new(access: A, spec: FlipSpec) -> Result<Self, Error> {
+        spec.check_source(access.size())?;
+        Ok(Self {
             access,
             spec,
             dtype: PhantomData,
@@ -674,6 +670,10 @@ impl<A: Access<T>, T: Number> Enqueue<Heap, T> for MatDiag<A, T> {
     type Buffer = Vec<T>;
 
     fn enqueue(&self) -> Result<Self::Buffer, Error> {
+        if self.size() == 0 {
+            return Ok(Vec::new());
+        }
+
         let input = self.access.read()?.to_slice()?;
 
         let diagonals = input
@@ -694,6 +694,10 @@ impl<A: Access<T>, T: Number> Enqueue<Stack, T> for MatDiag<A, T> {
     type Buffer = StackVec<T>;
 
     fn enqueue(&self) -> Result<Self::Buffer, Error> {
+        if self.size() == 0 {
+            return Ok(StackVec::new());
+        }
+
         let input = self.access.read()?.to_slice()?;
 
         let diagonals = input
@@ -769,6 +773,10 @@ where
     type Buffer = StackVec<T>;
 
     fn enqueue(&self) -> Result<Self::Buffer, Error> {
+        if self.size() == 0 {
+            return Ok(StackVec::new());
+        }
+
         let left = self.left.read()?.to_slice()?;
         let right = self.right.read()?.to_slice()?;
 
@@ -811,6 +819,10 @@ where
 
     fn enqueue(&self) -> Result<Self::Buffer, Error> {
         let [a, b, c] = self.dims;
+
+        if self.size() == 0 || b == 0 {
+            return Ok(vec![T::ZERO; self.size()]);
+        }
 
         let (left, right) = try_join_read(&self.left, &self.right)?;
 
@@ -1099,132 +1111,40 @@ where
     }
 }
 
-pub struct RandomNormal {
-    size: usize,
-}
-
-impl RandomNormal {
-    pub fn new(size: usize) -> Self {
-        Self { size }
-    }
-
-    fn box_muller(u: [f32; 2]) -> [f32; 2] {
-        let [u1, u2] = u;
+pub fn random_normal(size: usize) -> Result<Buffer<f32>, Error> {
+    fn box_muller([u1, u2]: [f32; 2]) -> [f32; 2] {
         let r = ((1.0 - u1).ln() * -2.).sqrt();
         let theta = 2. * PI * u2;
         [r * theta.cos(), r * theta.sin()]
     }
-}
 
-impl Op for RandomNormal {
-    fn size(&self) -> usize {
-        self.size
+    if size == 0 {
+        return Ok(Buffer::Stack(StackVec::new()));
     }
+    let mut rng = crate::random::rng()?;
+    let output = iter::repeat_with(|| [rng.gen(), rng.gen()])
+        .take(size.div_ceil(2))
+        .flat_map(box_muller)
+        .take(size);
+
+    Ok(if size < VEC_MIN_SIZE {
+        Buffer::Stack(output.collect())
+    } else {
+        Buffer::Heap(output.collect())
+    })
 }
 
-impl Enqueue<Heap, f32> for RandomNormal {
-    type Buffer = Vec<f32>;
-
-    fn enqueue(&self) -> Result<Self::Buffer, Error> {
-        let mut rng = Rand::new();
-
-        let mut output = (0..self.size.div_ceil(2))
-            .flat_map(|_| Self::box_muller([rng.gen(), rng.gen()]))
-            .collect::<Vec<f32>>();
-
-        if output.len() > self.size {
-            output.pop();
-        }
-
-        debug_assert_eq!(output.len(), self.size);
-
-        Ok(output)
+pub fn random_uniform(size: usize) -> Result<Buffer<f32>, Error> {
+    if size == 0 {
+        return Ok(Buffer::Stack(StackVec::new()));
     }
-}
-
-impl Enqueue<Stack, f32> for RandomNormal {
-    type Buffer = StackVec<f32>;
-
-    fn enqueue(&self) -> Result<Self::Buffer, Error> {
-        let mut rng = Rand::new();
-
-        let mut output = iter::repeat_with(|| [rng.gen(), rng.gen()])
-            .take(self.size.div_ceil(2))
-            .flat_map(Self::box_muller)
-            .collect::<StackVec<f32>>();
-
-        if output.len() > self.size {
-            output.pop();
-        }
-
-        debug_assert_eq!(output.len(), self.size);
-
-        Ok(output)
-    }
-}
-
-impl Enqueue<Host, f32> for RandomNormal {
-    type Buffer = Buffer<f32>;
-
-    fn enqueue(&self) -> Result<Self::Buffer, Error> {
-        host_enqueue!(self, self.size < VEC_MIN_SIZE, f32)
-    }
-}
-
-impl ReadValue<Host, f32> for RandomNormal {
-    fn read_value(&self, _offset: usize) -> Result<f32, Error> {
-        Err(Error::bounds(
-            "cannot calculate an individual value of a random normal distribution".to_string(),
-        ))
-    }
-}
-
-pub struct RandomUniform {
-    size: usize,
-}
-
-impl RandomUniform {
-    pub fn new(size: usize) -> Self {
-        Self { size }
-    }
-}
-
-impl Op for RandomUniform {
-    fn size(&self) -> usize {
-        self.size
-    }
-}
-
-impl Enqueue<Heap, f32> for RandomUniform {
-    type Buffer = Vec<f32>;
-
-    fn enqueue(&self) -> Result<Self::Buffer, Error> {
-        let mut rng = Rand::new();
-        Ok((0..self.size).map(|_| rng.gen()).collect())
-    }
-}
-
-impl Enqueue<Stack, f32> for RandomUniform {
-    type Buffer = StackVec<f32>;
-
-    fn enqueue(&self) -> Result<Self::Buffer, Error> {
-        let mut rng = Rand::new();
-        Ok((0..self.size).map(|_| rng.gen()).collect())
-    }
-}
-
-impl Enqueue<Host, f32> for RandomUniform {
-    type Buffer = Buffer<f32>;
-
-    fn enqueue(&self) -> Result<Self::Buffer, Error> {
-        host_enqueue!(self, self.size < VEC_MIN_SIZE, f32)
-    }
-}
-
-impl ReadValue<Host, f32> for RandomUniform {
-    fn read_value(&self, _offset: usize) -> Result<f32, Error> {
-        Ok(Rand::new().gen())
-    }
+    let mut rng = crate::random::rng()?;
+    let output = (0..size).map(|_| rng.gen());
+    Ok(if size < VEC_MIN_SIZE {
+        Buffer::Stack(output.collect())
+    } else {
+        Buffer::Heap(output.collect())
+    })
 }
 
 pub struct Reduce<A, T> {
@@ -1291,6 +1211,10 @@ impl<A: Access<T>, T: Number> Enqueue<Heap, T> for Reduce<A, T> {
     type Buffer = Vec<T>;
 
     fn enqueue(&self) -> Result<Self::Buffer, Error> {
+        if self.stride == 1 {
+            return self.access.read()?.to_slice().map(|slice| slice.into_vec());
+        }
+
         self.access
             .read()
             .and_then(|buf| buf.to_slice())
@@ -1315,6 +1239,14 @@ impl<A: Access<T>, T: Number> Enqueue<Stack, T> for Reduce<A, T> {
     type Buffer = StackVec<T>;
 
     fn enqueue(&self) -> Result<Self::Buffer, Error> {
+        if self.stride == 1 {
+            return self
+                .access
+                .read()?
+                .to_slice()
+                .map(|slice| slice.into_stackvec());
+        }
+
         self.access
             .read()
             .and_then(|buf| buf.to_slice())
@@ -1341,6 +1273,14 @@ impl<A: Access<T>, T: Number> Enqueue<Host, T> for Reduce<A, T> {
 
 impl<A: Access<T>, T: Number> ReadValue<Host, T> for Reduce<A, T> {
     fn read_value(&self, offset: usize) -> Result<T, Error> {
+        if offset >= self.size() {
+            return Err(Error::bounds(format!("invalid reduction offset {offset}")));
+        }
+
+        if self.stride == 1 {
+            return self.access.read_value(offset);
+        }
+
         let offset = offset * self.stride;
 
         if offset < self.access.size() {
@@ -1363,15 +1303,14 @@ pub struct Slice<A, T> {
     dtype: PhantomData<T>,
 }
 
-impl<A, T> Slice<A, T> {
-    pub fn new(access: A, shape: &[usize], range: Range) -> Self {
-        let spec = SliceSpec::new(shape, range);
-
-        Self {
+impl<A: Access<T>, T: Number> Slice<A, T> {
+    pub fn new(access: A, spec: SliceSpec) -> Result<Self, Error> {
+        spec.check_source(access.size())?;
+        Ok(Self {
             access,
             spec,
             dtype: PhantomData,
-        }
+        })
     }
 }
 
@@ -1393,45 +1332,6 @@ impl<A: Send + Sync, T: Copy + Send + Sync> Slice<A, T> {
             .collect();
 
         Ok(output)
-    }
-}
-
-impl<A, T> Slice<A, T>
-where
-    T: Number,
-    A: AccessMut<T>,
-{
-    fn overwrite<'a>(&mut self, data: BufferConverter<'a, T>) -> Result<(), Error> {
-        if data.len() == self.size() {
-            let data = data.to_slice()?;
-
-            for (offset, value) in data.iter().copied().enumerate() {
-                let source_offset = self.spec.source_offset(offset);
-                self.access.write_value_at(source_offset, value)?;
-            }
-
-            Ok(())
-        } else {
-            Err(Error::bounds(format!(
-                "cannot overwrite a slice of size {} with a buffer of size {}",
-                self.size(),
-                data.len(),
-            )))
-        }
-    }
-
-    fn overwrite_value(&mut self, value: T) -> Result<(), Error> {
-        for offset in 0..self.access.size() {
-            let source_offset = self.spec.source_offset(offset);
-            self.access.write_value_at(source_offset, value)?;
-        }
-
-        Ok(())
-    }
-
-    fn overwrite_value_at(&mut self, offset: usize, value: T) -> Result<(), Error> {
-        let source_offset = self.spec.source_offset(offset);
-        self.access.write_value_at(source_offset, value)
     }
 }
 
@@ -1475,60 +1375,6 @@ impl<A: Access<T>, T: Number> ReadValue<Host, T> for Slice<A, T> {
     fn read_value(&self, offset: usize) -> Result<T, Error> {
         let offset = self.spec.source_offset(offset);
         self.access.read_value(offset)
-    }
-}
-
-impl<A, T> crate::ops::Write<Heap, T> for Slice<A, T>
-where
-    T: Number,
-    A: AccessMut<T>,
-{
-    fn write<'a>(&mut self, data: BufferConverter<'a, T>) -> Result<(), Error> {
-        self.overwrite(data)
-    }
-
-    fn write_value(&mut self, value: T) -> Result<(), Error> {
-        self.overwrite_value(value)
-    }
-
-    fn write_value_at(&mut self, offset: usize, value: T) -> Result<(), Error> {
-        self.overwrite_value_at(offset, value)
-    }
-}
-
-impl<A, T> crate::ops::Write<Stack, T> for Slice<A, T>
-where
-    T: Number,
-    A: AccessMut<T>,
-{
-    fn write<'a>(&mut self, data: BufferConverter<'a, T>) -> Result<(), Error> {
-        self.overwrite(data)
-    }
-
-    fn write_value(&mut self, value: T) -> Result<(), Error> {
-        self.overwrite_value(value)
-    }
-
-    fn write_value_at(&mut self, offset: usize, value: T) -> Result<(), Error> {
-        self.overwrite_value_at(offset, value)
-    }
-}
-
-impl<A, T> crate::ops::Write<Host, T> for Slice<A, T>
-where
-    T: Number,
-    A: AccessMut<T>,
-{
-    fn write<'a>(&mut self, data: BufferConverter<'a, T>) -> Result<(), Error> {
-        self.overwrite(data)
-    }
-
-    fn write_value(&mut self, value: T) -> Result<(), Error> {
-        self.overwrite_value(value)
-    }
-
-    fn write_value_at(&mut self, offset: usize, value: T) -> Result<(), Error> {
-        self.overwrite_value_at(offset, value)
     }
 }
 
@@ -1771,26 +1617,13 @@ pub struct View<A, T> {
 }
 
 impl<A: Access<T>, T: Number> View<A, T> {
-    pub fn broadcast(access: A, shape: Shape, broadcast: Shape) -> Self {
-        let source_strides = strides_for(&shape, shape.len()).collect();
-
-        Self {
+    pub fn new(access: A, spec: ViewSpec) -> Result<Self, Error> {
+        spec.check_source(access.size())?;
+        Ok(Self {
             access,
-            spec: ViewSpec::new(broadcast, source_strides),
+            spec,
             dtype: PhantomData,
-        }
-    }
-
-    pub fn transpose(access: A, shape: Shape, axes: Axes) -> Self {
-        let strides = strides_for(&shape, shape.len()).collect::<Strides>();
-        let shape = axes.iter().copied().map(|x| shape[x]).collect::<Strides>();
-        let source_strides = axes.into_iter().map(|x| strides[x]).collect::<Strides>();
-
-        Self {
-            access,
-            spec: ViewSpec::new(shape, source_strides),
-            dtype: PhantomData,
-        }
+        })
     }
 }
 

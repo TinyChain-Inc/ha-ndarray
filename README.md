@@ -1,62 +1,130 @@
 # ha-ndarray
-An n-dimensional array for Rust, with [OpenCL](https://www.khronos.org/opencl/) hardware acceleration
-implemented using the [ocl](https://github.com/cogciprocate/ocl) crate.
 
-Use the `opencl` feature flag to enable OpenCL support.
+An n-dimensional array library for Rust with Host and optional OpenCL execution.
+Operations build lazy, read-only expressions; concrete buffers provide writable
+storage. [NUMERICS.md](NUMERICS.md) defines arithmetic, accuracy, shapes, and
+backend requirements. [CONTRIBUTING.md](CONTRIBUTING.md) covers validation.
 
-Platform selection is automatic based on workload size within user-configured
-constraints. The platform type restricts eligible backends: `Host` selects host
-execution, `OpenCL` selects OpenCL execution, and `Platform` chooses between them
-when OpenCL is enabled. Converting an array to the general `ArrayAccess` type
-allows subsequent scheduling to reselect its backend. Axis reductions select from
-the input element count and use that selection for transforms, execution, and
-the returned array.
+## Getting started
 
-The OpenCL device-class constraint is read during platform initialization. Set
-`HA_NDARRAY_OPENCL_DEVICE` to `CPU`, `GPU`, or `ACCELERATOR` to select one class
-explicitly; otherwise workload-size thresholds select the class and fail closed
-if that class is unavailable. This setting constrains OpenCL device selection;
-it does not force every operation on the general `Platform` to use OpenCL.
-Selection does not authorize switching to another backend or device after a
-capability, compilation, execution, or capacity failure.
-For example, run the NVIDIA GPU suite with:
+Import the traits for the operations you use. Numerical operations and transforms
+consume their receiver; use `as_ref()` to build an expression while retaining its
+source.
 
-```sh
-HA_NDARRAY_OPENCL_DEVICE=GPU cargo test --features opencl
+```rust
+use ha_ndarray::{
+    range, shape, ArrayBuf, AxisRange, Error, NDArrayRead, NDArrayTransform, NDArrayWrite,
+};
+
+# fn main() -> Result<(), Error> {
+let source = ArrayBuf::new(vec![1i32, 2, 3, 4], shape![2, 2])?;
+let row = source.as_ref().slice(range![AxisRange::At(1), AxisRange::In(0, 2, 1)])?;
+assert_eq!(&*row.buffer()?.to_slice()?, &[3, 4]);
+
+let mut copy = row.copy()?;
+copy.write_value_at(&[0], 9)?;
+assert_eq!(copy.read_value(&[0])?, 9);
+assert_eq!(source.read_value(&[1, 0])?, 3);
+# Ok(())
+# }
 ```
 
-OpenCL is a trademark of Apple Inc. used by permission by the Khronos Group. For more information on OpenCL in general, see:
+Shape `[]` is a scalar containing one element; `[0]` is empty. Indexing every axis
+and reducing every axis with `keepdims = false` produce scalars. Broadcasting
+and dtype conversion are explicit.
 
- - [A Gentle Introduction to OpenCL](https://freecontent.manning.com/wp-content/uploads/a-gentle-introduction-to-opencl.pdf) by Matthew Scarpino
+## Ownership and evaluation
 
- - [The OpenCL C Programming Language](https://registry.khronos.org/OpenCL/specs/2.2/html/OpenCL_C.html) published by the Khronos Group
+| Need | Interface |
+| --- | --- |
+| Inspect or build a scoped expression | `as_ref()` borrows the accessor and owns shape metadata. |
+| Retain shared readers | `ArrayAccess::from(array)` stores one shared, read-only accessor. Cloning retains it. |
+| Mutate values | Use `NDArrayWrite` on a mutable concrete buffer array. |
+| Obtain independent writable storage | `copy()` evaluates and copies the values. |
+| Finish an expression or consume a buffer | `into_read()` returns owned storage on the array's current platform. |
 
- - This excellent overview of OpenCL kernel programming & optimization: https://www.nersc.gov/assets/pubs_presos/MattsonTutorialSC14.pdf
+Lazy transforms, including slices, are read-only. Concrete buffer arrays do not
+implement `Clone`; immutable accessor references and shared `ArrayAccess` arrays
+do. Borrowed data cannot outlive its source, and live read borrows prevent writes.
+Extracting an owned accessor consumes its array. Native callers handing off a
+buffer must stop mutating any retained raw aliases; handoff cannot revoke them.
 
- - A benchmarking tool for comparing numpy, ndarray, and ha-ndarray is available in the `benchmark` branch and can be built there with `cargo run --bin benchmark --features benchmark`.
+Consuming reads move owned storage when backend and representation permit it.
+Borrowed/shared buffers copy when independent ownership is needed; backend
+transfers and small-buffer conversions may allocate. Host FFT can reuse an
+eligible owned input workspace. Borrowed and shared FFT inputs remain unchanged.
 
-The `freqfs` feature enables file-guard buffer integration and destream support;
-it does not select a filesystem byte codec. File-entry owners implement
-`freqfs::FileLoad` and `FileSave` with their chosen codec.
+Fallible array constructors and transforms validate shape products, axes, ranges,
+and source cardinality before backend work. Slice, broadcast, transpose, and flip
+share validated metadata with their backends. Raw operation constructors and
+custom-platform dispatch are internal. Custom native accessors must report
+consistent buffer lengths.
 
-## Numerical compatibility
+## Backends and features
 
-See [NUMERICS.md](NUMERICS.md) for dtype rules, exceptional values, accuracy limits,
-cast compatibility, and unsupported capabilities. Downstream storage libraries
-inherit this contract rather than duplicating arithmetic policy.
+`Host` restricts execution to host memory/CPU, `OpenCL` restricts it to OpenCL,
+and the general `Platform` selects by workload size among enabled backends.
+Use `ha_ndarray::host::ArrayBuf` for explicitly Host-backed buffers. Converting to
+`ArrayAccess` permits subsequent operations to select through the general
+platform. Axis reductions select using the input element count, then use that
+selection for prerequisite transforms, execution, and the returned array.
 
-CPU-OpenCL conformance requires PoCL, the OpenCL development loader, and m4 for
-the development-only MPFR/MPC oracle. Run with HA_NDARRAY_OPENCL_DEVICE=CPU and
-features opencl,complex. Set CC=/usr/bin/cc, CXX=/usr/bin/c++, M4=/usr/bin/m4,
-and CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/cc when a Conda compiler
-shadows system libraries.
+With OpenCL enabled, set `HA_NDARRAY_OPENCL_DEVICE` to `CPU`, `GPU`, or
+`ACCELERATOR` before platform initialization to constrain device selection.
+Otherwise workload thresholds select the device class. A missing device or a
+capability, compilation, execution, or capacity failure returns an error; it does
+not trigger another backend. Initialization and native OpenCL errors retain their
+causes. See [backend requirements](NUMERICS.md#backend-requirements-and-compatibility).
 
-Keep native and OpenCL target directories separate (for example target/host-tests
-and target/opencl-tests). Set POCL_CACHE_DIR to a writable directory in restricted
-environments. GPU conformance uses the manually dispatched opencl-gpu runner;
-missing required hardware is a failure, not a skipped pass.
+| Feature | Enables |
+| --- | --- |
+| `complex` | Complex32/Complex64 operations and Host FFT/IFFT. |
+| `opencl` | OpenCL execution; requires an installed loader and device driver/ICD. |
+| `stream` | destream serialization. |
+| `freqfs` | File-guard buffer integration and `stream`; file owners choose their codec. |
+| `wasm` | JavaScript entropy for browser/Node random construction; no JavaScript numerical bindings. |
+| `all` | `complex`, `freqfs`, `opencl`, and `stream`; excludes `wasm`. |
 
-The conformance suite uses certified MPFR/MPC bounds and exact rational aggregate
-references; see [the validation contract](NUMERICS.md#conformance-references-and-validation).
-Actual GPU validation remains pending and mandatory for full conformance, even
-when native and CPU-OpenCL validation pass.
+Without optional features, Host operations are available. Native OpenCL/filesystem
+configurations are separate from WASM builds.
+
+## Random construction
+
+`ArrayBuf::random_normal(size)` and `random_uniform(size)` return owned f32
+buffers sampled once at construction. Repeated buffer/point reads and shared
+expressions observe the same values.
+
+```rust
+use ha_ndarray::{ArrayAccess, ArrayBuf, Buffer, Error, NDArrayMath, NDArrayRead};
+
+# fn main() -> Result<(), Error> {
+let sample = ArrayBuf::<f32, Buffer<f32>>::random_uniform(16)?;
+let shared = ArrayAccess::from(sample);
+let difference = shared.clone().sub(shared)?;
+assert!(difference.buffer()?.to_slice()?.iter().all(|&value| value == 0.0));
+# Ok(())
+# }
+```
+
+Sampling obtains an eight-byte seed through `getrandom`; provider failures return
+`Error::Random` with their cause. Sequences are unspecified across calls and
+backends. Empty Host samples require no entropy; explicit OpenCL empty samples
+are unsupported. See [distribution and numerical rules](NUMERICS.md#accuracy-and-aggregates).
+
+## WASM and library artifacts
+
+Ordinary builds emit a Rust library. `wasm32-unknown-unknown` supports Host
+numerical operations. Enable `wasm` for browser/Node entropy; without it,
+nonempty random construction returns `Error::Unsupported`. JavaScript-enabled
+modules use wasm-bindgen's loading glue. Native/WASI builds use the host entropy
+provider where supported.
+
+For an explicit standalone dynamic library, use
+`cargo rustc --lib --features wasm --crate-type cdylib`, adding `--target` when
+cross-compiling. Do not unconditionally emit `cdylib` and `rlib` together: Cargo's
+unversioned output names can collide when a consumer builds application and test
+artifacts with different panic policies. The library leaves panic policy to its
+caller.
+
+See [validation guidance](CONTRIBUTING.md#validation) for Host, CPU-OpenCL, GPU,
+and Node checks and the boundaries each establishes.

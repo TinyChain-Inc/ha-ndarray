@@ -6,15 +6,6 @@ use std::ops::{Add, Div, Mul, Sub};
 
 use number_general as ng;
 use safecast::CastFrom;
-
-#[cfg(feature = "complex")]
-pub use num_complex as complex;
-pub use smallvec::smallvec as axes;
-pub use smallvec::smallvec as coord;
-pub use smallvec::smallvec as range;
-pub use smallvec::smallvec as slice;
-pub use smallvec::smallvec as shape;
-pub use smallvec::smallvec as stackvec;
 use smallvec::SmallVec;
 
 pub use access::*;
@@ -28,7 +19,13 @@ pub use array::{
 pub use array::{MatrixUnaryComplex, NDArrayComplex, NDArrayFourier};
 pub use buffer::{Buffer, BufferConverter, BufferInstance, BufferMut};
 pub use host::StackVec;
+#[cfg(feature = "complex")]
+pub use num_complex as complex;
 pub use platform::*;
+pub use smallvec::{
+    smallvec as axes, smallvec as coord, smallvec as range, smallvec as slice, smallvec as shape,
+    smallvec as stackvec,
+};
 
 mod access;
 mod array;
@@ -39,8 +36,9 @@ pub mod host;
 mod numeric;
 #[cfg(feature = "opencl")]
 pub mod opencl;
-pub mod ops;
+mod ops;
 mod platform;
+mod random;
 
 fn id<T>(this: T) -> T {
     this
@@ -56,17 +54,28 @@ pub trait CLType:
 pub trait CLType: PartialEq + Copy + Send + Sync + fmt::Display + fmt::Debug + 'static {}
 
 impl CLType for f32 {}
+
 impl CLType for f64 {}
+
 impl CLType for i8 {}
+
 impl CLType for i16 {}
+
 impl CLType for i32 {}
+
 impl CLType for i64 {}
+
 impl CLType for u8 {}
+
 impl CLType for u16 {}
+
 impl CLType for u32 {}
+
 impl CLType for u64 {}
+
 #[cfg(feature = "complex")]
 impl CLType for complex::Complex<f32> {}
+
 #[cfg(feature = "complex")]
 impl CLType for complex::Complex<f64> {}
 
@@ -83,7 +92,7 @@ pub trait Number: CLType + Into<ng::Number> + CastFrom<ng::Number> + Default {
 
     // arithmetic
 
-    /// Construct an instance of this type from a [`f64`].
+    /// Return the absolute value, using the corresponding real dtype for complex values.
     fn abs(self) -> Self::Abs;
 
     /// Add two instances of this type.
@@ -660,24 +669,21 @@ complex_type!(complex::Complex64, f64);
 pub enum Error {
     Bounds(String),
     Unsupported(String),
+    #[cfg(any(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        feature = "wasm"
+    ))]
+    Random(getrandom::Error),
     #[cfg(feature = "opencl")]
     OCL(std::sync::Arc<ocl::Error>),
 }
 
 impl Error {
     pub fn bounds(msg: String) -> Self {
-        #[cfg(feature = "debug_crash")]
-        panic!("{}", msg);
-
-        #[cfg(not(feature = "debug_crash"))]
         Self::Bounds(msg)
     }
 
     pub fn unsupported(msg: String) -> Self {
-        #[cfg(feature = "debug_crash")]
-        panic!("{}", msg);
-
-        #[cfg(not(feature = "debug_crash"))]
         Self::Unsupported(msg)
     }
 }
@@ -689,6 +695,11 @@ impl Clone for Error {
         match self {
             Self::Bounds(msg) => Self::Bounds(msg.clone()),
             Self::Unsupported(msg) => Self::Unsupported(msg.clone()),
+            #[cfg(any(
+                not(all(target_arch = "wasm32", target_os = "unknown")),
+                feature = "wasm"
+            ))]
+            Self::Random(cause) => Self::Random(*cause),
             #[cfg(feature = "opencl")]
             Self::OCL(cause) => Self::OCL(cause.clone()),
         }
@@ -698,10 +709,6 @@ impl Clone for Error {
 #[cfg(feature = "opencl")]
 impl From<ocl::Error> for Error {
     fn from(cause: ocl::Error) -> Self {
-        #[cfg(feature = "debug_crash")]
-        panic!("OpenCL error: {:?}", cause);
-
-        #[cfg(not(feature = "debug_crash"))]
         Self::OCL(std::sync::Arc::new(cause))
     }
 }
@@ -711,6 +718,11 @@ impl fmt::Debug for Error {
         match self {
             Self::Bounds(cause) => f.write_str(cause),
             Self::Unsupported(cause) => f.write_str(cause),
+            #[cfg(any(
+                not(all(target_arch = "wasm32", target_os = "unknown")),
+                feature = "wasm"
+            ))]
+            Self::Random(cause) => write!(f, "random seed acquisition failed: {cause}"),
             #[cfg(feature = "opencl")]
             Self::OCL(cause) => cause.fmt(f),
         }
@@ -722,13 +734,31 @@ impl fmt::Display for Error {
         match self {
             Self::Bounds(cause) => f.write_str(cause),
             Self::Unsupported(cause) => f.write_str(cause),
+            #[cfg(any(
+                not(all(target_arch = "wasm32", target_os = "unknown")),
+                feature = "wasm"
+            ))]
+            Self::Random(cause) => write!(f, "random seed acquisition failed: {cause}"),
             #[cfg(feature = "opencl")]
             Self::OCL(cause) => cause.fmt(f),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(any(
+                not(all(target_arch = "wasm32", target_os = "unknown")),
+                feature = "wasm"
+            ))]
+            Self::Random(cause) => Some(cause),
+            #[cfg(feature = "opencl")]
+            Self::OCL(cause) => Some(cause.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// A list of n-dimensional array axes
 pub type Axes = SmallVec<[usize; 8]>;
@@ -751,7 +781,7 @@ pub type ArrayBuf<T, B> = array::Array<T, AccessBuf<B>, Platform>;
 /// The result of an n-dimensional array operation
 pub type ArrayOp<T, Op> = array::Array<T, AccessOp<Op>, Platform>;
 
-/// A general type of n-dimensional array used to elide recursive types
+/// An array with a shared, read-only accessor for independently retained readers.
 pub type ArrayAccess<'a, T> = array::Array<T, Accessor<'a, T>, Platform>;
 
 /// An accessor for the result of an n-dimensional array operation on the top-level [`Platform`]
@@ -772,11 +802,12 @@ impl AxisRange {
     }
 
     /// Return the number of elements contained within this bound.
-    /// Returns `None` for an index bound.
+    /// Returns `None` for an index bound. Native callers must first validate
+    /// ordered bounds and a nonzero step; array slicing performs that validation.
     pub fn size(&self) -> Option<usize> {
         match self {
             Self::At(_) => None,
-            Self::In(start, stop, step) => Some((stop - start) / step),
+            Self::In(start, stop, step) => Some((stop - start).div_ceil(*step)),
             Self::Of(indices) => Some(indices.len()),
         }
     }
@@ -882,6 +913,17 @@ fn broadcast_dim(left: Option<usize>, right: Option<usize>) -> Result<Option<usi
 }
 
 #[inline]
+// Fallible entrypoints validate cardinality before backend selection/allocation.
+fn checked_size(shape: &[usize]) -> Result<usize, Error> {
+    let checked = |size: usize, &dim: &usize| {
+        size.checked_mul(dim)
+            .ok_or_else(|| Error::bounds("array shape cardinality overflow".into()))
+    };
+    shape.iter().try_fold(1, checked)?;
+    shape.iter().rev().try_fold(1, checked)
+}
+
+#[inline]
 fn range_shape(source_shape: &[usize], range: &[AxisRange]) -> Shape {
     debug_assert_eq!(source_shape.len(), range.len());
     range.iter().filter_map(|ar| ar.size()).collect()
@@ -904,3 +946,20 @@ pub fn strides_for<'a>(shape: &'a [usize], ndim: usize) -> impl Iterator<Item = 
 
     zeros.chain(strides)
 }
+
+// Private backend fixtures retain direct-kernel coverage without exporting construction.
+#[cfg(test)]
+extern crate self as ha_ndarray;
+
+#[cfg(test)]
+#[macro_use]
+#[path = "../tests/unit/conformance/mod.rs"]
+mod conformance;
+
+#[cfg(test)]
+#[path = "../tests/unit/numerics.rs"]
+mod numerics;
+
+#[cfg(test)]
+#[path = "../tests/unit/native.rs"]
+mod native_tests;
