@@ -157,6 +157,40 @@ sums/dots, the absolute exact product for products, and the input absolute sum
 for FFTs. These bounds do not apply for ku>=1 or intermediate range violations.
 Extreme-input aggregate classifications can differ with evaluation order.
 
+### Streaming statistics
+
+The `statistics` module owns bounded, mergeable f64 accumulators for arithmetic
+mean, Euclidean norm, and population standard deviation. Callers own input
+conversion and traversal. Complex callers accumulate real and imaginary means
+and central moments independently. `StandardDeviation::finish_norm` combines
+scaled component moments before rounding the resulting deviation norm.
+This prevents a large constant component from hiding variation in another one.
+
+Mean uses a compensated sum scaled by a power of two. Norm scales its sum of
+squares; standard deviation scales Welford/parallel central moments before
+subtraction and squaring. Thus large or tiny inputs do not require representable
+unscaled sums, squared magnitudes, or variances. Final overflow and subnormal
+rounding still follow IEEE arithmetic. Scaling does not promise exact recovery
+after arbitrary cancellation or bitwise agreement across traversal/merge orders.
+For finite inputs, assess mean error against the mean absolute input and deviation
+error against the input magnitude as well as the spread; near-constant data can
+have large relative deviation error. Counts retain exact u64 cardinality;
+statistical weights convert to f64 and round above 2^53. Count overflow returns a
+structured bounds error without changing the receiving accumulator. Tensor
+callers validate logical cardinality separately.
+
+`Mean::from_batch` borrows an admitted input slice and accepts a component
+projection. It validates cardinality before projection, then uses the same
+scaled, compensated sum as single-value accumulation, without allocating an
+intermediate component buffer. Conversion and input-size admission remain caller
+responsibilities.
+
+Empty mean and standard deviation yield NaN; empty norm yields positive zero.
+Mean propagates NaN and opposite infinities, preserving a sole infinity sign.
+Standard deviation yields NaN for any nonfinite input. Norm propagates NaN even
+in the presence of infinity; otherwise any infinity yields positive infinity.
+Merging an empty accumulator is an identity.
+
 FFT/IFFT operate independently on each last-axis batch and are unnormalized:
 ifft(fft(x)) approximates N*x. Fourier point reads remain unsupported. Scalar
 Fourier transforms remain unsupported because they have no transform axis.

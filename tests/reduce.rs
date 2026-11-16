@@ -4,6 +4,9 @@ use ha_ndarray::{
     NDArrayTransform,
 };
 
+#[path = "unit/statistics.rs"]
+mod statistics;
+
 #[test]
 fn test_reduce_sum_all() -> Result<(), Error> {
     for x in 1..9 {
@@ -133,7 +136,7 @@ fn full_axis_reductions_preserve_scalar_shapes() -> Result<(), Error> {
         }
         let scalar = ArrayBuf::new(vec![7i32], shape![])?;
         let result = scalar.sum(axes![], keepdims)?;
-        assert_eq!(result.shape(), &[]);
+        assert!(result.shape().is_empty());
         assert_eq!(result.read_value(&[])?, 7);
     }
     Ok(())
