@@ -39,6 +39,7 @@ pub mod opencl;
 mod ops;
 mod platform;
 mod random;
+pub mod statistics;
 
 fn id<T>(this: T) -> T {
     this

@@ -25,6 +25,8 @@ macro_rules! op_dispatch {
     };
 }
 
+pub(crate) use op_dispatch;
+
 macro_rules! op_enqueue {
     ($this:expr, $t:ty) => {
         match $this {
