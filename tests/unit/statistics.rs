@@ -1,10 +1,13 @@
-use ha_ndarray::statistics::{Mean, Norm, StandardDeviation, StatisticsElement};
+use ha_ndarray::host::Host;
+use ha_ndarray::statistics::{
+    BlockReduce, Mean, MeanOp, Norm, NormOp, StandardDeviation, StandardDeviationOp,
+};
 
 fn partial(values: &[f64]) -> (Mean, Norm, StandardDeviation) {
     (
-        f64::mean_batch(values).unwrap(),
-        f64::norm_batch(values),
-        f64::deviation_batch(values).unwrap(),
+        BlockReduce::<Host, f64>::partial(&MeanOp, values).unwrap(),
+        BlockReduce::<Host, f64>::partial(&NormOp, values).unwrap(),
+        BlockReduce::<Host, f64>::partial(&StandardDeviationOp, values).unwrap(),
     )
 }
 
@@ -13,9 +16,10 @@ fn partial(values: &[f64]) -> (Mean, Norm, StandardDeviation) {
 fn complex_mean_accumulates_both_components() {
     use ha_ndarray::complex::Complex64 as C;
 
-    let left = C::mean_batch(&[C::new(1e308, 1.)]).unwrap();
-    let right = C::mean_batch(&[C::new(1e308, 2.)]).unwrap();
-    let mean = C::finish_mean(C::merge_mean(left, right).unwrap());
+    let left = BlockReduce::<Host, C>::partial(&MeanOp, &[C::new(1e308, 1.)]).unwrap();
+    let right = BlockReduce::<Host, C>::partial(&MeanOp, &[C::new(1e308, 2.)]).unwrap();
+    let state = <MeanOp as BlockReduce<Host, C>>::merge(left, right).unwrap();
+    let mean = <MeanOp as BlockReduce<Host, C>>::finish(state);
     assert_eq!(mean, C::new(1e308, 1.5));
 }
 
@@ -24,38 +28,50 @@ fn integer_statistics_preserve_differences_before_conversion() {
     let signed = [i64::MIN, i64::MAX];
     let unsigned = [u64::MAX - 1, u64::MAX];
     for split in 0..=unsigned.len() {
-        let left = i64::mean_batch(&signed[..split]).unwrap();
-        let right = i64::mean_batch(&signed[split..]).unwrap();
-        for mean in [i64::merge_mean(left, right), i64::merge_mean(right, left)] {
-            assert_eq!(i64::finish_mean(mean.unwrap()), -0.5);
+        let left = BlockReduce::<Host, i64>::partial(&MeanOp, &signed[..split]).unwrap();
+        let right = BlockReduce::<Host, i64>::partial(&MeanOp, &signed[split..]).unwrap();
+        for (left, right) in [(left, right), (right, left)] {
+            let state = <MeanOp as BlockReduce<Host, i64>>::merge(left, right).unwrap();
+            assert_eq!(<MeanOp as BlockReduce<Host, i64>>::finish(state), -0.5);
         }
 
-        let left = u64::deviation_batch(&unsigned[..split]).unwrap();
-        let right = u64::deviation_batch(&unsigned[split..]).unwrap();
-        for deviation in [
-            u64::merge_deviation(left, right),
-            u64::merge_deviation(right, left),
-        ] {
-            assert_eq!(u64::finish_deviation(deviation.unwrap()), 0.5);
+        let left =
+            BlockReduce::<Host, u64>::partial(&StandardDeviationOp, &unsigned[..split]).unwrap();
+        let right =
+            BlockReduce::<Host, u64>::partial(&StandardDeviationOp, &unsigned[split..]).unwrap();
+        for (left, right) in [(left, right), (right, left)] {
+            let state =
+                <StandardDeviationOp as BlockReduce<Host, u64>>::merge(left, right).unwrap();
+            assert_eq!(
+                <StandardDeviationOp as BlockReduce<Host, u64>>::finish(state),
+                0.5
+            );
         }
 
-        let left = i64::deviation_batch(&signed[..split]).unwrap();
-        let right = i64::deviation_batch(&signed[split..]).unwrap();
+        let left =
+            BlockReduce::<Host, i64>::partial(&StandardDeviationOp, &signed[..split]).unwrap();
+        let right =
+            BlockReduce::<Host, i64>::partial(&StandardDeviationOp, &signed[split..]).unwrap();
+        let state = <StandardDeviationOp as BlockReduce<Host, i64>>::merge(left, right).unwrap();
         close(
-            i64::finish_deviation(i64::merge_deviation(left, right).unwrap()),
+            <StandardDeviationOp as BlockReduce<Host, i64>>::finish(state),
             2f64.powi(63),
         );
     }
 
-    let one = u64::mean_batch(&[u64::MAX]).unwrap();
-    let mut mean = u64::mean_batch(&[]).unwrap();
+    let one = BlockReduce::<Host, u64>::partial(&MeanOp, &[u64::MAX]).unwrap();
+    let mut mean = BlockReduce::<Host, u64>::partial(&MeanOp, &[]).unwrap();
     for _ in 0..64 {
-        mean = u64::merge_mean(u64::merge_mean(mean, mean).unwrap(), one).unwrap();
+        mean = <MeanOp as BlockReduce<Host, u64>>::merge(mean, mean).unwrap();
+        mean = <MeanOp as BlockReduce<Host, u64>>::merge(mean, one).unwrap();
     }
 
-    assert_eq!(u64::finish_mean(mean), u64::MAX as f64);
+    assert_eq!(
+        <MeanOp as BlockReduce<Host, u64>>::finish(mean),
+        u64::MAX as f64
+    );
     assert!(matches!(
-        u64::merge_mean(mean, one),
+        <MeanOp as BlockReduce<Host, u64>>::merge(mean, one),
         Err(ha_ndarray::Error::Bounds(_))
     ));
 }
@@ -179,7 +195,10 @@ fn implicit_zero_multiplicity_uses_bounded_merge_state() {
 fn component_deviations_combine_before_subnormal_rounding() {
     use ha_ndarray::complex::Complex64 as C;
 
-    let deviation = |values: &[C]| C::finish_deviation(C::deviation_batch(values).unwrap());
+    let deviation = |values: &[C]| {
+        let state = BlockReduce::<Host, C>::partial(&StandardDeviationOp, values).unwrap();
+        <StandardDeviationOp as BlockReduce<Host, C>>::finish(state)
+    };
     let tiny = f64::from_bits(1);
     let (_, _, component) = partial(&[0., tiny]);
     assert_eq!(component.finish(), 0.);

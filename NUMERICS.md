@@ -182,8 +182,9 @@ statistical weights convert to f64 and round above 2^53. Count overflow returns 
 structured bounds error without changing the receiving accumulator. Tensor
 callers validate logical cardinality separately.
 
-`StatisticsElement` accumulates borrowed slices and merges partials without
-intermediate component buffers.
+`MeanOp`, `StandardDeviationOp`, and `NormOp` implement `BlockReduce` for borrowed
+host slices. Each operation accumulates a block and merges partials without
+intermediate component buffers. Callers own block traversal and merge order.
 
 Empty mean and standard deviation yield NaN; empty norm yields positive zero.
 Mean propagates NaN and opposite infinities, preserving a sole infinity sign.
