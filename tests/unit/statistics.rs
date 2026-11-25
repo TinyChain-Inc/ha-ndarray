@@ -1,28 +1,63 @@
-use ha_ndarray::statistics::{Mean, Norm, StandardDeviation};
+use ha_ndarray::statistics::{Mean, Norm, StandardDeviation, StatisticsElement};
 
 fn partial(values: &[f64]) -> (Mean, Norm, StandardDeviation) {
-    let mut mean = Mean::default();
-    let mut norm = Norm::default();
-    let mut deviation = StandardDeviation::default();
-    for &value in values {
-        mean.push(value).unwrap();
-        norm.push(value);
-        deviation.push(value).unwrap();
-    }
+    (
+        f64::mean_batch(values).unwrap(),
+        f64::norm_batch(values),
+        f64::deviation_batch(values).unwrap(),
+    )
+}
 
-    let batched_mean = Mean::from_batch(values, |value| *value).unwrap();
-    close(batched_mean.finish(), mean.finish());
+#[cfg(feature = "complex")]
+#[test]
+fn complex_mean_accumulates_both_components() {
+    use ha_ndarray::complex::Complex64 as C;
 
-    (batched_mean, norm, deviation)
+    let left = C::mean_batch(&[C::new(1e308, 1.)]).unwrap();
+    let right = C::mean_batch(&[C::new(1e308, 2.)]).unwrap();
+    let mean = C::finish_mean(C::merge_mean(left, right).unwrap());
+    assert_eq!(mean, C::new(1e308, 1.5));
 }
 
 #[test]
-fn batches_borrow_components_and_count_samples() {
-    let values = [(1e308, 1.), (1e308, 2.)];
-    let mean = Mean::from_batch(&values, |value| value.0).unwrap();
-    let imaginary = Mean::from_batch(&values, |value| value.1).unwrap();
-    assert_eq!(mean.finish(), 1e308);
-    assert_eq!(imaginary.finish(), 1.5);
+fn integer_statistics_preserve_differences_before_conversion() {
+    let signed = [i64::MIN, i64::MAX];
+    let unsigned = [u64::MAX - 1, u64::MAX];
+    for split in 0..=unsigned.len() {
+        let left = i64::mean_batch(&signed[..split]).unwrap();
+        let right = i64::mean_batch(&signed[split..]).unwrap();
+        for mean in [i64::merge_mean(left, right), i64::merge_mean(right, left)] {
+            assert_eq!(i64::finish_mean(mean.unwrap()), -0.5);
+        }
+
+        let left = u64::deviation_batch(&unsigned[..split]).unwrap();
+        let right = u64::deviation_batch(&unsigned[split..]).unwrap();
+        for deviation in [
+            u64::merge_deviation(left, right),
+            u64::merge_deviation(right, left),
+        ] {
+            assert_eq!(u64::finish_deviation(deviation.unwrap()), 0.5);
+        }
+
+        let left = i64::deviation_batch(&signed[..split]).unwrap();
+        let right = i64::deviation_batch(&signed[split..]).unwrap();
+        close(
+            i64::finish_deviation(i64::merge_deviation(left, right).unwrap()),
+            2f64.powi(63),
+        );
+    }
+
+    let one = u64::mean_batch(&[u64::MAX]).unwrap();
+    let mut mean = u64::mean_batch(&[]).unwrap();
+    for _ in 0..64 {
+        mean = u64::merge_mean(u64::merge_mean(mean, mean).unwrap(), one).unwrap();
+    }
+
+    assert_eq!(u64::finish_mean(mean), u64::MAX as f64);
+    assert!(matches!(
+        u64::merge_mean(mean, one),
+        Err(ha_ndarray::Error::Bounds(_))
+    ));
 }
 
 fn close(actual: f64, expected: f64) {
@@ -139,20 +174,20 @@ fn implicit_zero_multiplicity_uses_bounded_merge_state() {
     );
 }
 
+#[cfg(feature = "complex")]
 #[test]
 fn component_deviations_combine_before_subnormal_rounding() {
+    use ha_ndarray::complex::Complex64 as C;
+
+    let deviation = |values: &[C]| C::finish_deviation(C::deviation_batch(values).unwrap());
     let tiny = f64::from_bits(1);
     let (_, _, component) = partial(&[0., tiny]);
     assert_eq!(component.finish(), 0.);
-    assert_eq!(StandardDeviation::finish_norm([component, component]), tiny);
-
-    let (_, _, constant) = partial(&[1e308, 1e308]);
-    let (_, _, small) = partial(&[1., 2.]);
-    assert_eq!(StandardDeviation::finish_norm([constant, small]), 0.5);
-    assert_eq!(StandardDeviation::finish_norm([small, constant]), 0.5);
-    assert!(StandardDeviation::finish_norm([StandardDeviation::default()]).is_nan());
-    let (_, _, nonfinite) = partial(&[f64::INFINITY]);
-    assert!(StandardDeviation::finish_norm([constant, nonfinite]).is_nan());
+    assert_eq!(deviation(&[C::new(0., 0.), C::new(tiny, tiny)][..]), tiny);
+    assert_eq!(deviation(&[C::new(1e308, 1.), C::new(1e308, 2.)][..]), 0.5);
+    assert_eq!(deviation(&[C::new(1., 1e308), C::new(2., 1e308)][..]), 0.5);
+    assert!(deviation(&[]).is_nan());
+    assert!(deviation(&[C::new(1e308, f64::INFINITY)]).is_nan());
 }
 
 #[cfg(not(target_family = "wasm"))]

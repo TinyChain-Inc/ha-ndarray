@@ -13,11 +13,11 @@ pub type ArrayBuf<T> = crate::array::Array<T, AccessBuf<Buffer<T>>, Host>;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::{
         shape, slice, AxisRange, Error, MatrixDual, NDArray, NDArrayCompare, NDArrayRead,
         NDArrayReduceBoolean, NDArrayTransform, NDArrayWrite, Shape,
     };
+    use super::*;
 
     #[test]
     fn test_matmul_large() -> Result<(), Error> {

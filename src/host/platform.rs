@@ -1,7 +1,5 @@
 use rayon::prelude::*;
 
-use super::buffer::Buffer;
-use super::ops::*;
 use crate::access::{Access, AccessOp};
 use crate::buffer::BufferConverter;
 use crate::host::StackVec;
@@ -14,6 +12,8 @@ use crate::ops::{
 };
 use crate::platform::{Convert, PlatformInstance};
 use crate::{stackvec, Constant, Error, Float, Number, Real};
+use super::buffer::Buffer;
+use super::ops::*;
 
 pub const VEC_MIN_SIZE: usize = 64;
 

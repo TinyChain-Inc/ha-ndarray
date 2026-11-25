@@ -1,7 +1,7 @@
 use memoize::memoize;
 
-use super::{build, Builder, ElementDual, ElementUnary, Program};
 use crate::Error;
+use super::{build, Builder, ElementDual, ElementUnary, Program};
 
 const LIB: &str = r#"
 const float pi = 3.14159265358979323846f;

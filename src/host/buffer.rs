@@ -4,9 +4,9 @@ use std::ops::Deref;
 
 use smallvec::SmallVec;
 
-use super::VEC_MIN_SIZE;
 use crate::buffer::{BufferConverter, BufferInstance, BufferMut};
 use crate::{Error, Number};
+use super::VEC_MIN_SIZE;
 
 /// A stack-allocated buffer.
 pub type StackVec<T> = SmallVec<[T; VEC_MIN_SIZE]>;

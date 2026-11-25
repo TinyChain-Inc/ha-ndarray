@@ -3,13 +3,13 @@ use std::marker::PhantomData;
 use number_general as ng;
 use ocl::{Buffer, Kernel, Queue};
 
-use super::platform::OpenCL;
-use super::programs::Program;
-use super::{programs, CLElement, TILE_SIZE, WG_SIZE};
 use crate::access::Access;
 use crate::opencl::programs::{ElementDual, ElementUnary};
 use crate::ops::{Concat, Enqueue, FlipSpec, Op, ReadValue, SliceSpec, ViewSpec};
 use crate::{Error, Float, Number, Platform, Real};
+use super::platform::OpenCL;
+use super::programs::Program;
+use super::{programs, CLElement, TILE_SIZE, WG_SIZE};
 
 pub struct Cast<A, IT, OT> {
     access: A,

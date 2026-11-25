@@ -1,8 +1,8 @@
 use memoize::memoize;
 
-use super::{build, ArrayFormat, Program};
-use crate::ops::{FlipSpec, ViewSpec};
 use crate::Error;
+use crate::ops::{FlipSpec, ViewSpec};
+use super::{build, ArrayFormat, Program};
 
 #[memoize(Capacity: 1024)]
 pub fn flip(c_type: &'static str, spec: FlipSpec) -> Result<Program, Error> {

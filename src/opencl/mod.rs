@@ -3,10 +3,10 @@
 use lazy_static::lazy_static;
 use ocl::OclPrm;
 
-use self::programs::{ElementDual, ElementUnary};
+use crate::Float;
 use crate::access::{AccessBuf, AccessOp};
 use crate::host::VEC_MIN_SIZE;
-use crate::Float;
+use self::programs::{ElementDual, ElementUnary};
 
 pub use buffer::*;
 pub use platform::{OpenCL, ACC_MIN_SIZE, GPU_MIN_SIZE};
@@ -1259,13 +1259,13 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     #[cfg(feature = "complex")]
     use crate::NDArrayTrig;
     use crate::{
         shape, slice, AxisRange, Error, MatrixDual, NDArray, NDArrayCompare, NDArrayMath,
         NDArrayRead, NDArrayReduceBoolean, NDArrayTransform, NDArrayWrite, Shape,
     };
+    use super::*;
 
     #[cfg(feature = "complex")]
     fn assert_complex32_close(

@@ -1,7 +1,7 @@
 use memoize::memoize;
 
-use super::{build, Builder, ElementDual, Program};
 use crate::Error;
+use super::{build, Builder, ElementDual, Program};
 
 #[memoize]
 pub fn fold_axis(op: ElementDual) -> Result<Program, Error> {

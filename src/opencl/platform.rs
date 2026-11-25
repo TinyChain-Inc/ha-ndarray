@@ -5,8 +5,6 @@ use ocl::{Buffer, Context, Device, DeviceType, Event, Kernel, Platform, Queue};
 use rayon::prelude::*;
 use smallvec::SmallVec;
 
-use super::ops::*;
-use super::{programs, CLElementTrig, CL_PLATFORM, WG_SIZE};
 use crate::access::{Access, AccessOp};
 use crate::buffer::BufferConverter;
 use crate::opencl::programs::ElementDual;
@@ -19,6 +17,8 @@ use crate::ops::{
 };
 use crate::platform::{Convert, PlatformInstance};
 use crate::{Constant, Error, Float, Number, Real};
+use super::ops::*;
+use super::{programs, CLElementTrig, CL_PLATFORM, WG_SIZE};
 
 #[cfg(debug_assertions)]
 pub const GPU_MIN_SIZE: usize = 128;
