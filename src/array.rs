@@ -6,7 +6,7 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use crate::access::{Access, AccessBuf, AccessMut, AccessOp, Accessor};
-use crate::buffer::BufferInstance;
+use crate::buffer::{Buffer, BufferInstance};
 use crate::ops::*;
 use crate::platform::PlatformInstance;
 #[cfg(feature = "complex")]
@@ -231,6 +231,29 @@ where
             platform,
             dtype: PhantomData,
         })
+    }
+}
+
+impl<T: Number> Array<T, AccessBuf<Buffer<T>>, Platform> {
+    /// Replace values equal to numerical zero with the dtype's canonical zero.
+    pub fn normalize_zeros(mut self) -> Result<Self, Error> {
+        match self.access.inner_mut() {
+            Buffer::Host(buffer) => {
+                for value in buffer.as_mut() {
+                    if *value == T::ZERO {
+                        *value = T::ZERO;
+                    }
+                }
+
+                Ok(self)
+            }
+            #[cfg(feature = "opencl")]
+            Buffer::CL(_) => {
+                let mask = self.as_ref().eq_scalar(T::ZERO)?.into_read()?;
+                let zeros = Self::constant(T::ZERO, self.shape.clone())?;
+                mask.cond(zeros, self)?.into_read()
+            }
+        }
     }
 }
 

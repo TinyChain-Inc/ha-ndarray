@@ -1,12 +1,46 @@
-//! Bounded, mergeable f64 statistical accumulators.
+//! Bounded, mergeable statistical accumulators.
 //!
-//! Callers own traversal and conversion of integer/complex components. These
-//! accumulators own numerical scaling; they allocate no buffers. Counts retain
-//! exact u64 cardinality; conversion to f64 rounds statistical weights above 2^53.
+//! Callers supply bounded blocks; accumulators own conversion and scaling.
+//! They allocate no buffers. Counts retain exact u64 cardinality; conversion to
+//! f64 rounds statistical weights above 2^53.
 
 #![forbid(unsafe_code)]
 
-use crate::Error;
+use crate::host::Host;
+use crate::{Error, Number, PlatformInstance};
+
+/// A reduction over bounded blocks on platform `P` with element type `T`.
+///
+/// The caller supplies blocks in the platform's representation and controls
+/// traversal and merge order. The built-in operations use borrowed host slices.
+pub trait BlockReduce<P: PlatformInstance, T: Number>: Send + Sync {
+    type Block: ?Sized;
+    type Output: Number;
+
+    /// Fixed-size state. Its default value represents empty input.
+    type State: Copy + Default + Send + Sync;
+
+    /// Reduce one block, retaining only its partial state.
+    fn partial(&self, block: &Self::Block) -> Result<Self::State, Error>;
+
+    /// Combine states representing disjoint inputs.
+    fn merge(left: Self::State, right: Self::State) -> Result<Self::State, Error>;
+
+    /// Produce the reduction result, including the operation's empty-input value.
+    fn finish(state: Self::State) -> Self::Output;
+}
+
+/// Arithmetic mean, including both components of complex values.
+#[derive(Clone, Copy, Debug)]
+pub struct MeanOp;
+
+/// Population standard deviation using squared complex magnitude.
+#[derive(Clone, Copy, Debug)]
+pub struct StandardDeviationOp;
+
+/// Euclidean norm over real or complex values.
+#[derive(Clone, Copy, Debug)]
+pub struct NormOp;
 
 fn count(left: u64, right: u64) -> Result<u64, Error> {
     left.checked_add(right)
@@ -46,7 +80,6 @@ impl Sum {
         self.sum = sum;
     }
 
-    // Borrowed batch projections can specialize constant zero components.
     #[inline]
     fn push(&mut self, value: f64) {
         if !value.is_finite() || !self.sum.is_finite() {
@@ -80,22 +113,16 @@ pub struct Mean {
 }
 
 impl Mean {
-    /// Accumulate a borrowed batch with caller-owned component conversion.
-    /// Validate cardinality once before evaluating any component.
-    pub fn from_batch<T>(values: &[T], component: impl Fn(&T) -> f64) -> Result<Self, Error> {
-        let count = u64::try_from(values.len())
-            .map_err(|_| Error::bounds("statistics input cardinality overflow".into()))?;
-
-        let mut state = Self {
-            count,
-            ..Self::default()
-        };
-
+    fn from_batch<T>(values: &[T], component: impl Fn(&T) -> f64) -> Self {
+        let mut sum = Sum::default();
         for value in values {
-            state.sum.push(component(value));
+            sum.push(component(value));
         }
 
-        Ok(state)
+        Self {
+            count: values.len() as u64,
+            sum,
+        }
     }
 
     /// Include one value. Count overflow returns a bounds error without mutation.
@@ -196,7 +223,6 @@ impl StandardDeviation {
 
     /// Include one value using scaled Welford central moments.
     /// Count overflow returns a bounds error without mutation.
-    // Let adapters specialize the constant zero component of real inputs.
     #[inline]
     pub fn push(&mut self, value: f64) -> Result<(), Error> {
         self.count = count(self.count, 1)?;
@@ -215,7 +241,11 @@ impl StandardDeviation {
 
     /// Combine disjoint inputs using scaled parallel central moments.
     /// Return a bounds error on count overflow.
-    pub fn merge(mut self, mut other: Self) -> Result<Self, Error> {
+    pub fn merge(self, other: Self) -> Result<Self, Error> {
+        self.merge_shifted(other, 0.)
+    }
+
+    fn merge_shifted(mut self, mut other: Self, offset: f64) -> Result<Self, Error> {
         if self.count == 0 {
             return Ok(other);
         } else if other.count == 0 {
@@ -223,10 +253,18 @@ impl StandardDeviation {
         }
 
         let count = count(self.count, other.count)?;
-        let scale = self.scale.max(other.scale);
-        self.rescale(scale);
-        other.rescale(scale);
-        let delta = other.mean - self.mean;
+        let mut normalization = self.scale.max(other.scale);
+        if offset != 0. {
+            normalization = normalization.max(scale(offset.abs()));
+        }
+
+        self.rescale(normalization);
+        other.rescale(normalization);
+        let mut delta = other.mean - self.mean;
+        if offset != 0. {
+            delta += offset / normalization;
+        }
+
         let weight = other.count as f64 / count as f64;
         self.mean += delta * weight;
         self.squares += other.squares + delta * delta * self.count as f64 * weight;
@@ -241,7 +279,8 @@ impl StandardDeviation {
 
     /// Return the norm of component deviations, combining scaled moments before
     /// final rounding. For complex inputs, supply real and imaginary components.
-    pub fn finish_norm(components: impl IntoIterator<Item = Self>) -> f64 {
+    #[cfg(feature = "complex")]
+    fn finish_norm(components: [Self; 2]) -> f64 {
         let mut norm = Norm::default();
         for component in components {
             let squares = component.squares / component.count as f64;
@@ -257,5 +296,242 @@ impl StandardDeviation {
             }
         }
         norm.finish()
+    }
+}
+
+/// Exact integer sum and count for a streaming mean.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IntegerMean<S> {
+    count: u64,
+    sum: S,
+}
+
+/// Central moments relative to an integer origin.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IntegerDeviation {
+    origin: i128,
+    moments: StandardDeviation,
+}
+
+macro_rules! real_norm {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl BlockReduce<Host, $ty> for NormOp {
+            type Block = [$ty];
+            type Output = f64;
+            type State = Norm;
+
+            fn partial(&self, values: &Self::Block) -> Result<Norm, Error> {
+                let mut norm = Norm::default();
+                for &value in values {
+                    norm.push(value as f64);
+                }
+
+                Ok(norm)
+            }
+
+            fn merge(left: Norm, right: Norm) -> Result<Norm, Error> {
+                Ok(left.merge(right))
+            }
+
+            fn finish(state: Norm) -> f64 {
+                state.finish()
+            }
+        }
+    )+};
+}
+
+real_norm!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
+
+macro_rules! integer_statistics {
+    ($sum:ty; $($ty:ty),+ $(,)?) => {$(
+        impl BlockReduce<Host, $ty> for MeanOp {
+            type Block = [$ty];
+            type Output = f64;
+            type State = IntegerMean<$sum>;
+
+            fn partial(&self, values: &Self::Block) -> Result<Self::State, Error> {
+                let sum = values.iter().copied().map(<$sum>::from).sum();
+                Ok(IntegerMean {
+                    count: values.len() as u64,
+                    sum,
+                })
+            }
+
+            fn merge(left: Self::State, right: Self::State) -> Result<Self::State, Error> {
+                // With a valid count, the sum of these 64-bit values fits the 128-bit state.
+                Ok(IntegerMean {
+                    count: count(left.count, right.count)?,
+                    sum: left.sum + right.sum,
+                })
+            }
+
+            fn finish(state: Self::State) -> f64 {
+                state.sum as f64 / state.count as f64
+            }
+        }
+
+        impl BlockReduce<Host, $ty> for StandardDeviationOp {
+            type Block = [$ty];
+            type Output = f64;
+            type State = IntegerDeviation;
+
+            fn partial(&self, values: &Self::Block) -> Result<IntegerDeviation, Error> {
+                let origin = i128::from(values.first().copied().unwrap_or_default());
+                let mut moments = StandardDeviation::default();
+                for &value in values {
+                    moments.push((i128::from(value) - origin) as f64)?;
+                }
+
+                Ok(IntegerDeviation { origin, moments })
+            }
+
+            fn merge(left: IntegerDeviation, right: IntegerDeviation) -> Result<IntegerDeviation, Error> {
+                if left.moments.count == 0 {
+                    return Ok(right);
+                }
+
+                let offset = (right.origin - left.origin) as f64;
+                let moments = left.moments.merge_shifted(right.moments, offset)?;
+                Ok(IntegerDeviation { origin: left.origin, moments })
+            }
+
+            fn finish(state: IntegerDeviation) -> f64 {
+                state.moments.finish()
+            }
+        }
+    )+};
+}
+
+integer_statistics!(i128; i8, i16, i32, i64);
+integer_statistics!(u128; u8, u16, u32, u64);
+
+macro_rules! float_statistics {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl BlockReduce<Host, $ty> for MeanOp {
+            type Block = [$ty];
+            type Output = f64;
+            type State = Mean;
+
+            fn partial(&self, values: &Self::Block) -> Result<Mean, Error> {
+                Ok(Mean::from_batch(values, |&value| f64::from(value)))
+            }
+
+            fn merge(left: Mean, right: Mean) -> Result<Mean, Error> {
+                left.merge(right)
+            }
+
+            fn finish(state: Mean) -> f64 {
+                state.finish()
+            }
+        }
+
+        impl BlockReduce<Host, $ty> for StandardDeviationOp {
+            type Block = [$ty];
+            type Output = f64;
+            type State = StandardDeviation;
+
+            fn partial(&self, values: &Self::Block) -> Result<StandardDeviation, Error> {
+                let mut moments = StandardDeviation::default();
+                for &value in values {
+                    moments.push(f64::from(value))?;
+                }
+
+                Ok(moments)
+            }
+
+            fn merge(left: Self::State, right: Self::State) -> Result<Self::State, Error> {
+                left.merge(right)
+            }
+
+            fn finish(state: StandardDeviation) -> f64 {
+                state.finish()
+            }
+        }
+    )+};
+}
+
+float_statistics!(f32, f64);
+
+#[cfg(feature = "complex")]
+impl<F: Copy + Into<f64>> BlockReduce<Host, crate::complex::Complex<F>> for MeanOp
+where
+    crate::complex::Complex<F>: Number,
+{
+    type Block = [crate::complex::Complex<F>];
+    type Output = crate::complex::Complex64;
+    type State = [Mean; 2];
+
+    // Keep the two compensated sums out of the caller's reduction loop.
+    #[inline(never)]
+    fn partial(&self, values: &Self::Block) -> Result<Self::State, Error> {
+        Ok([
+            Mean::from_batch(values, |value| value.re.into()),
+            Mean::from_batch(values, |value| value.im.into()),
+        ])
+    }
+
+    fn merge([re, im]: Self::State, [r, i]: Self::State) -> Result<Self::State, Error> {
+        Ok([re.merge(r)?, im.merge(i)?])
+    }
+
+    fn finish([re, im]: Self::State) -> Self::Output {
+        Self::Output::new(re.finish(), im.finish())
+    }
+}
+
+#[cfg(feature = "complex")]
+impl<F: Copy + Into<f64>> BlockReduce<Host, crate::complex::Complex<F>> for StandardDeviationOp
+where
+    crate::complex::Complex<F>: Number,
+{
+    type Block = [crate::complex::Complex<F>];
+    type Output = f64;
+    type State = [StandardDeviation; 2];
+
+    fn partial(&self, values: &Self::Block) -> Result<Self::State, Error> {
+        let mut re = StandardDeviation::default();
+        let mut im = StandardDeviation::default();
+        for value in values {
+            re.push(value.re.into())?;
+            im.push(value.im.into())?;
+        }
+
+        Ok([re, im])
+    }
+
+    fn merge([re, im]: Self::State, [r, i]: Self::State) -> Result<Self::State, Error> {
+        Ok([re.merge(r)?, im.merge(i)?])
+    }
+
+    fn finish(state: Self::State) -> f64 {
+        StandardDeviation::finish_norm(state)
+    }
+}
+
+#[cfg(feature = "complex")]
+impl<F: Copy + Into<f64>> BlockReduce<Host, crate::complex::Complex<F>> for NormOp
+where
+    crate::complex::Complex<F>: Number,
+{
+    type Block = [crate::complex::Complex<F>];
+    type Output = f64;
+    type State = Norm;
+
+    fn partial(&self, values: &Self::Block) -> Result<Norm, Error> {
+        let mut norm = Norm::default();
+        for value in values {
+            norm.push(value.re.into());
+            norm.push(value.im.into());
+        }
+
+        Ok(norm)
+    }
+
+    fn merge(left: Norm, right: Norm) -> Result<Norm, Error> {
+        Ok(left.merge(right))
+    }
+
+    fn finish(state: Norm) -> f64 {
+        state.finish()
     }
 }

@@ -1,5 +1,4 @@
 pub mod oracle;
-
 #[macro_use]
 mod aggregate;
 
