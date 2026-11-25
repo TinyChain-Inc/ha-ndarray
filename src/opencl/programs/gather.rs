@@ -1,7 +1,7 @@
 use memoize::memoize;
 
-use crate::Error;
 use super::{build, Program};
+use crate::Error;
 
 #[memoize]
 pub fn gather_cond(c_type: &'static str) -> Result<Program, Error> {

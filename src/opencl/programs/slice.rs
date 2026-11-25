@@ -2,9 +2,9 @@ use std::fmt;
 
 use memoize::memoize;
 
+use super::{build, ArrayFormat, Program};
 use crate::ops::SliceSpec;
 use crate::{AxisRange, Error};
-use super::{build, ArrayFormat, Program};
 
 #[derive(Clone, Eq, PartialEq, Hash)]
 struct RangeFormat<'a> {

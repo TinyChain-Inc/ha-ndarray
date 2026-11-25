@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::{shape, ArrayAccess, ArrayBuf, Error};
 use super::Accessor;
+use crate::{shape, ArrayAccess, ArrayBuf, Error};
 
 #[test]
 fn accessor_identity_conversion_retains_the_shared_owner() -> Result<(), Error> {

@@ -6,14 +6,14 @@ use number_general as ng;
 use rayon::join;
 use rayon::prelude::*;
 
-#[cfg(feature = "complex")]
-use crate::Complex;
-use crate::access::Access;
-use crate::ops::{Concat, Enqueue, FlipSpec, Op, ReadValue, SliceSpec, ViewSpec};
-use crate::{Error, Float, Number, Platform, Real};
 use super::buffer::Buffer;
 use super::platform::{Heap, Host, Stack};
 use super::{SliceConverter, StackVec, VEC_MIN_SIZE};
+use crate::access::Access;
+use crate::ops::{Concat, Enqueue, FlipSpec, Op, ReadValue, SliceSpec, ViewSpec};
+#[cfg(feature = "complex")]
+use crate::Complex;
+use crate::{Error, Float, Number, Platform, Real};
 
 #[cfg(feature = "complex")]
 pub mod complex;

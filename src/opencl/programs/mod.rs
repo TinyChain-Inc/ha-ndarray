@@ -1,7 +1,7 @@
 use std::fmt;
 
-use crate::Error;
 use super::{CLElement, OpenCL, TILE_SIZE, WG_SIZE};
+use crate::Error;
 
 pub mod constructors;
 pub mod elementwise;
